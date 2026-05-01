@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Environment
+.env
+.venv/
+venv/
+
+# Output
+output/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# PyInstaller
+*.spec.bak
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Whisper model cache
+*.pt
+
+# Local test data
+VideoDemo/
+
+# User settings
+settings.json
