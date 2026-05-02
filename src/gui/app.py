@@ -13,7 +13,10 @@ from PySide6.QtWidgets import (
     QToolButton, QSpinBox,
 )
 from PySide6.QtCore import Qt, QThread, Signal
-from src.config import load_settings, Settings, RESOLUTION_SCALES, WHISPER_MODELS
+from src.config import (
+    load_settings, Settings, RESOLUTION_SCALES, WHISPER_MODELS,
+    VISION_MODELS_OLLAMA, VISION_MODELS_CLOUD,
+)
 from src.gui.theme import build_stylesheet
 from src.gui.settings_dialog import SettingsDialog
 
@@ -265,7 +268,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(g)
 
         # 图片理解区
-        vg = QGroupBox("图片理解 (本地 Ollama)")
+        vg = QGroupBox("图片理解")
         vgrid = QGridLayout(vg)
         vgrid.setSpacing(6)
         vgrid.setContentsMargins(12, 14, 12, 8)
@@ -274,10 +277,10 @@ class MainWindow(QMainWindow):
         vgrid.addWidget(self._label("视觉模型"), 0, 0)
         self.vision_model_combo = QComboBox()
         self.vision_model_combo.setEditable(True)
-        self.vision_model_combo.addItems([
-            "minicpm-v:8b", "llava:7b-v1.6", "llava-llama3:8b",
-            "qwen2-vl:7b", "moondream:1.8b",
-        ])
+        if self.settings.vision_type == "cloud":
+            self.vision_model_combo.addItems(VISION_MODELS_CLOUD)
+        else:
+            self.vision_model_combo.addItems(VISION_MODELS_OLLAMA)
         self.vision_model_combo.setCurrentText(self.settings.vision_model)
         vgrid.addWidget(self.vision_model_combo, 0, 1)
         self.btn_analyze = QPushButton("开始分析")

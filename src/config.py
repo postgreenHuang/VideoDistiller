@@ -15,6 +15,25 @@ SETTINGS_FILE = PROJECT_ROOT / "settings.json"
 RESOLUTION_SCALES = ["1/2", "1/4", "1/6", "1/8", "1/10", "1/12"]
 WHISPER_MODELS = ["tiny", "base", "small", "medium", "large-v3"]
 
+VISION_MODELS_OLLAMA = [
+    "minicpm-v:8b", "llava:7b-v1.6", "llava-llama3:8b",
+    "qwen2-vl:7b", "moondream:1.8b",
+]
+VISION_MODELS_CLOUD = [
+    "glm-4v-plus", "glm-4v-flash",
+    "qwen-vl-max", "qwen-vl-plus",
+    "gpt-4o", "claude-sonnet-4-6",
+]
+
+CLOUD_API_PRESETS = {
+    "glm-4v-plus": "https://open.bigmodel.cn/api/paas/v4",
+    "glm-4v-flash": "https://open.bigmodel.cn/api/paas/v4",
+    "qwen-vl-max": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "qwen-vl-plus": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "gpt-4o": "https://api.openai.com/v1",
+    "claude-sonnet-4-6": "https://api.anthropic.com/v1",
+}
+
 
 @dataclass
 class ProviderConfig:
@@ -41,7 +60,10 @@ class Settings:
     whisper_language: str = ""
     segment_length: int = 180
     ollama_url: str = "http://localhost:11434"
+    vision_type: str = "ollama"  # "ollama" | "cloud"
     vision_model: str = "minicpm-v:8b"
+    vision_api_url: str = ""
+    vision_api_key: str = ""
     providers: list = field(default_factory=lambda: [
         {"name": "Gemini", "base_url": "", "api_key": "", "model": "gemini-1.5-pro"},
         {"name": "OpenAI", "base_url": "", "api_key": "", "model": "gpt-4o"},

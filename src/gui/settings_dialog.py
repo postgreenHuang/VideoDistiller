@@ -10,7 +10,10 @@ from PySide6.QtWidgets import (
     QScrollArea,
 )
 from PySide6.QtCore import Qt
-from src.config import Settings, save_settings, RESOLUTION_SCALES, WHISPER_MODELS
+from src.config import (
+    Settings, save_settings, RESOLUTION_SCALES, WHISPER_MODELS,
+    VISION_MODELS_OLLAMA, VISION_MODELS_CLOUD, CLOUD_API_PRESETS,
+)
 
 
 class SettingsDialog(QDialog):
@@ -106,20 +109,39 @@ class SettingsDialog(QDialog):
 
         layout.addWidget(g)
 
-        # Ollama 视觉模型
-        vg = QGroupBox("本地视觉模型 (图片理解)")
+        # 图片理解模型
+        vg = QGroupBox("图片理解模型")
         vgrid = QGridLayout(vg)
         vgrid.setSpacing(6)
 
-        vgrid.addWidget(QLabel("Ollama 地址:"), 0, 0)
-        self.ollama_url_edit = QLineEdit()
-        self.ollama_url_edit.setPlaceholderText("http://localhost:11434")
-        vgrid.addWidget(self.ollama_url_edit, 0, 1)
+        vgrid.addWidget(QLabel("模式:"), 0, 0)
+        self.vision_type_combo = QComboBox()
+        self.vision_type_combo.addItems(["Ollama 本地", "云端 API"])
+        self.vision_type_combo.currentIndexChanged.connect(self._on_vision_type_changed)
+        vgrid.addWidget(self.vision_type_combo, 0, 1)
 
-        vgrid.addWidget(QLabel("视觉模型:"), 1, 0)
+        vgrid.addWidget(QLabel("模型:"), 1, 0)
         self.vision_model_edit = QLineEdit()
         self.vision_model_edit.setPlaceholderText("minicpm-v:8b")
         vgrid.addWidget(self.vision_model_edit, 1, 1)
+
+        # Ollama 专属行
+        vgrid.addWidget(QLabel("Ollama 地址:"), 2, 0)
+        self.ollama_url_edit = QLineEdit()
+        self.ollama_url_edit.setPlaceholderText("http://localhost:11434")
+        vgrid.addWidget(self.ollama_url_edit, 2, 1)
+
+        # 云端 API 专属行
+        vgrid.addWidget(QLabel("API 地址:"), 3, 0)
+        self.vision_api_url_edit = QLineEdit()
+        self.vision_api_url_edit.setPlaceholderText("https://open.bigmodel.cn/api/paas/v4")
+        vgrid.addWidget(self.vision_api_url_edit, 3, 1)
+
+        vgrid.addWidget(QLabel("API Key:"), 4, 0)
+        self.vision_api_key_edit = QLineEdit()
+        self.vision_api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.vision_api_key_edit.setPlaceholderText("sk-...")
+        vgrid.addWidget(self.vision_api_key_edit, 4, 1)
 
         layout.addWidget(vg)
 
@@ -273,6 +295,10 @@ class SettingsDialog(QDialog):
         self.prompt_edit.setPlainText(s.default_distill_prompt)
         self.ollama_url_edit.setText(s.ollama_url)
         self.vision_model_edit.setText(s.vision_model)
+        self.vision_api_url_edit.setText(s.vision_api_url)
+        self.vision_api_key_edit.setText(s.vision_api_key)
+        self.vision_type_combo.setCurrentIndex(0 if s.vision_type == "ollama" else 1)
+        self._on_vision_type_changed(self.vision_type_combo.currentIndex())
         self.vision_ocr_edit.setPlainText(s.vision_prompt_ocr)
         self.vision_diagram_edit.setPlainText(s.vision_prompt_diagram)
         self.vision_title_edit.setPlainText(s.vision_prompt_title)
@@ -284,7 +310,6 @@ class SettingsDialog(QDialog):
         self._refresh_vocab_list()
 
     def _save(self):
-        # 先保存当前编辑中的 provider/vocab
         self._save_current_provider()
         self._save_current_vocab()
 
@@ -298,7 +323,10 @@ class SettingsDialog(QDialog):
         s.segment_length = self.segment_spin.value()
         s.default_distill_prompt = self.prompt_edit.toPlainText()
         s.ollama_url = self.ollama_url_edit.text()
+        s.vision_type = "ollama" if self.vision_type_combo.currentIndex() == 0 else "cloud"
         s.vision_model = self.vision_model_edit.text()
+        s.vision_api_url = self.vision_api_url_edit.text()
+        s.vision_api_key = self.vision_api_key_edit.text()
         s.vision_prompt_ocr = self.vision_ocr_edit.toPlainText()
         s.vision_prompt_diagram = self.vision_diagram_edit.toPlainText()
         s.vision_prompt_title = self.vision_title_edit.toPlainText()
@@ -307,6 +335,29 @@ class SettingsDialog(QDialog):
 
         save_settings(s)
         self.accept()
+
+    # ─── 视觉模型模式切换 ───
+
+    def _on_vision_type_changed(self, index):
+        is_ollama = (index == 0)
+        # Ollama 行: row 2
+        self.ollama_url_edit.setVisible(is_ollama)
+        # 找到对应 label 并隐藏/显示
+        vgrid = self.ollama_url_edit.parent().layout()
+        for i in range(vgrid.count()):
+            item = vgrid.itemAt(i)
+            if item and item.widget():
+                row, _, _, _ = vgrid.getItemPosition(i)
+                if row == 2:
+                    item.widget().setVisible(is_ollama)
+                elif row in (3, 4):
+                    item.widget().setVisible(not is_ollama)
+
+        # 更新 placeholder
+        if is_ollama:
+            self.vision_model_edit.setPlaceholderText("minicpm-v:8b")
+        else:
+            self.vision_model_edit.setPlaceholderText("glm-4v-plus")
 
     # ─── Provider 管理 ───
 
