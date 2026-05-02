@@ -15,6 +15,16 @@ SETTINGS_FILE = PROJECT_ROOT / "settings.json"
 RESOLUTION_SCALES = ["1/2", "1/4", "1/6", "1/8", "1/10", "1/12"]
 WHISPER_MODELS = ["tiny", "base", "small", "medium", "large-v3"]
 
+ASR_CLOUD_MODELS = [
+    "whisper-large-v3",        # Groq
+    "whisper-large-v3-turbo",  # Groq turbo
+    "whisper-1",               # OpenAI
+]
+ASR_CLOUD_PRESETS = {
+    "Groq": "https://api.groq.com/openai/v1",
+    "OpenAI": "https://api.openai.com/v1",
+}
+
 VISION_MODELS_OLLAMA = [
     "minicpm-v:8b", "llava:7b-v1.6", "llava-llama3:8b",
     "qwen2-vl:7b", "moondream:1.8b",
@@ -61,6 +71,10 @@ class Settings:
     whisper_model: str = "large-v3"
     whisper_language: str = ""
     segment_length: int = 180
+    asr_type: str = "local"  # "local" | "cloud"
+    asr_api_url: str = ""
+    asr_api_key: str = ""
+    asr_cloud_model: str = "whisper-large-v3"
     ollama_url: str = "http://localhost:11434"
     vision_type: str = "ollama"  # "ollama" | "cloud"
     vision_model: str = "minicpm-v:8b"

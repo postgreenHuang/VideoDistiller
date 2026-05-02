@@ -13,6 +13,7 @@ from PySide6.QtCore import Qt
 from src.config import (
     Settings, save_settings, RESOLUTION_SCALES, WHISPER_MODELS,
     VISION_MODELS_OLLAMA, VISION_MODELS_CLOUD, CLOUD_API_PRESETS,
+    ASR_CLOUD_MODELS, ASR_CLOUD_PRESETS,
 )
 
 
@@ -108,6 +109,36 @@ class SettingsDialog(QDialog):
         grid.addWidget(self.segment_spin, 6, 1)
 
         layout.addWidget(g)
+
+        # 语音识别设置
+        ag = QGroupBox("语音识别设置")
+        agrid = QGridLayout(ag)
+        agrid.setSpacing(6)
+
+        agrid.addWidget(QLabel("模式:"), 0, 0)
+        self.asr_type_combo = QComboBox()
+        self.asr_type_combo.addItems(["本地 faster-whisper", "云端 API"])
+        self.asr_type_combo.currentIndexChanged.connect(self._on_asr_type_changed)
+        agrid.addWidget(self.asr_type_combo, 0, 1)
+
+        agrid.addWidget(QLabel("API 地址:"), 1, 0)
+        self.asr_api_url_edit = QLineEdit()
+        self.asr_api_url_edit.setPlaceholderText("https://api.groq.com/openai/v1")
+        agrid.addWidget(self.asr_api_url_edit, 1, 1)
+
+        agrid.addWidget(QLabel("API Key:"), 2, 0)
+        self.asr_api_key_edit = QLineEdit()
+        self.asr_api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.asr_api_key_edit.setPlaceholderText("sk-...")
+        agrid.addWidget(self.asr_api_key_edit, 2, 1)
+
+        agrid.addWidget(QLabel("云端模型:"), 3, 0)
+        self.asr_cloud_model_combo = QComboBox()
+        self.asr_cloud_model_combo.setEditable(True)
+        self.asr_cloud_model_combo.addItems(ASR_CLOUD_MODELS)
+        agrid.addWidget(self.asr_cloud_model_combo, 3, 1)
+
+        layout.addWidget(ag)
 
         # 图片理解模型
         vg = QGroupBox("图片理解模型")
@@ -293,6 +324,13 @@ class SettingsDialog(QDialog):
         self.whisper_combo.setCurrentText(s.whisper_model)
         self.segment_spin.setValue(s.segment_length)
         self.prompt_edit.setPlainText(s.default_distill_prompt)
+        # ASR
+        self.asr_type_combo.setCurrentIndex(0 if s.asr_type == "local" else 1)
+        self.asr_api_url_edit.setText(s.asr_api_url)
+        self.asr_api_key_edit.setText(s.asr_api_key)
+        self.asr_cloud_model_combo.setCurrentText(s.asr_cloud_model)
+        self._on_asr_type_changed(self.asr_type_combo.currentIndex())
+        # Vision
         self.ollama_url_edit.setText(s.ollama_url)
         self.vision_model_edit.setText(s.vision_model)
         self.vision_api_url_edit.setText(s.vision_api_url)
@@ -322,6 +360,12 @@ class SettingsDialog(QDialog):
         s.whisper_model = self.whisper_combo.currentText()
         s.segment_length = self.segment_spin.value()
         s.default_distill_prompt = self.prompt_edit.toPlainText()
+        # ASR
+        s.asr_type = "local" if self.asr_type_combo.currentIndex() == 0 else "cloud"
+        s.asr_api_url = self.asr_api_url_edit.text()
+        s.asr_api_key = self.asr_api_key_edit.text()
+        s.asr_cloud_model = self.asr_cloud_model_combo.currentText()
+        # Vision
         s.ollama_url = self.ollama_url_edit.text()
         s.vision_type = "ollama" if self.vision_type_combo.currentIndex() == 0 else "cloud"
         s.vision_model = self.vision_model_edit.text()
@@ -335,6 +379,18 @@ class SettingsDialog(QDialog):
 
         save_settings(s)
         self.accept()
+
+    # ─── ASR 模式切换 ───
+
+    def _on_asr_type_changed(self, index):
+        is_local = (index == 0)
+        agrid = self.asr_api_url_edit.parent().layout()
+        for i in range(agrid.count()):
+            item = agrid.itemAt(i)
+            if item and item.widget():
+                row, _, _, _ = agrid.getItemPosition(i)
+                if row in (1, 2, 3):
+                    item.widget().setVisible(not is_local)
 
     # ─── 视觉模型模式切换 ───
 

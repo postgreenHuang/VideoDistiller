@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QThread, Signal
 from src.config import (
     load_settings, save_settings, Settings, RESOLUTION_SCALES, WHISPER_MODELS,
-    VISION_MODELS_OLLAMA, VISION_MODELS_CLOUD,
+    VISION_MODELS_OLLAMA, VISION_MODELS_CLOUD, ASR_CLOUD_MODELS,
 )
 from src.gui.theme import build_stylesheet
 from src.gui.settings_dialog import SettingsDialog
@@ -323,11 +323,16 @@ class MainWindow(QMainWindow):
 
         grid.addWidget(self._label("模型"), 0, 0)
         self.model_combo = QComboBox()
-        self.model_combo.addItems(WHISPER_MODELS)
-        self.model_combo.setCurrentText(self.settings.whisper_model)
+        if self.settings.asr_type == "cloud":
+            self.model_combo.addItems(ASR_CLOUD_MODELS)
+            self.model_combo.setCurrentText(self.settings.asr_cloud_model)
+        else:
+            self.model_combo.addItems(WHISPER_MODELS)
+            self.model_combo.setCurrentText(self.settings.whisper_model)
         grid.addWidget(self.model_combo, 0, 1)
         self.btn_transcribe = QPushButton("开始转录")
         self.btn_transcribe.setFixedWidth(120)
+        self.btn_transcribe.clicked.connect(self._start_transcribe)
         grid.addWidget(self.btn_transcribe, 0, 2)
 
         grid.addWidget(self._label("语言"), 1, 0)
@@ -569,8 +574,66 @@ class MainWindow(QMainWindow):
         else:
             self.dedup_status.setText(f"失败: {result}")
 
+    # ─── Step 3: 语音转录 ───
 
-class _FFmpegWorker(QThread):
+    def _start_transcribe(self):
+        project_dir = self._get_project_dir()
+        if not project_dir:
+            self.statusBar().showMessage("请先选择视频路径和输出目录")
+            return
+
+        # 查找音频文件
+        audio_dir = project_dir / "audio"
+        if not audio_dir.exists():
+            self.statusBar().showMessage("请先完成音频提取 (Step 1)")
+            return
+        mp3_files = list(audio_dir.glob("*.mp3"))
+        if not mp3_files:
+            self.statusBar().showMessage("未找到 MP3 文件，请先完成音频提取")
+            return
+        audio_path = str(mp3_files[0])
+
+        # 获取参数
+        model = self.model_combo.currentText()
+        lang_map = {"自动检测": None, "中文": "zh", "英文": "en", "日文": "ja"}
+        language = lang_map.get(self.language_combo.currentText())
+
+        # 获取词表
+        vocabulary = None
+        vocab_name = self.vocab_combo.currentText()
+        if vocab_name != "无":
+            for v in self.settings.vocabularies:
+                if v["name"] == vocab_name:
+                    vocabulary = v["terms"]
+                    break
+
+        self.btn_transcribe.setEnabled(False)
+        self.transcribe_progress.setValue(0)
+        self.statusBar().showMessage(f"正在转录 ({model})...")
+
+        self._transcribe_worker = _TranscribeWorker(
+            audio_path, str(project_dir), self.settings,
+            model, language, vocabulary,
+        )
+        self._transcribe_worker.progress.connect(lambda v: self.transcribe_progress.setValue(int(v * 100)))
+        self._transcribe_worker.finished.connect(self._on_transcribe_done)
+        self._transcribe_worker.start()
+
+    def _on_transcribe_done(self, ok, result):
+        self.btn_transcribe.setEnabled(True)
+        if ok and self._transcribe_worker.result:
+            self.transcribe_progress.setValue(100)
+            r = self._transcribe_worker.result
+            from src.transcribe import build_preview_text
+            self.transcript_preview.setPlainText(build_preview_text(r["segments"]))
+            meta = r["metadata"]
+            self.statusBar().showMessage(
+                f"转录完成: {meta['total_segments']} 段, "
+                f"{meta['total_chars']} 字 "
+                f"({meta['asr_type']}, {meta['model']})"
+            )
+        else:
+            self.statusBar().showMessage(f"转录失败: {result}")
     progress = Signal(float)
     finished = Signal(bool, str)
 
@@ -624,6 +687,41 @@ class _DedupWorker(QThread):
             self.result = deduplicate(
                 self.frames_dir, self.project_dir,
                 method=self.method, threshold=self.threshold,
+                progress_cb=lambda v: self.progress.emit(v),
+            )
+            self.finished.emit(True, "")
+        except Exception as e:
+            self.finished.emit(False, str(e))
+
+
+class _TranscribeWorker(QThread):
+    progress = Signal(float)
+    finished = Signal(bool, str)
+
+    def __init__(self, audio_path, project_dir, settings, model, language, vocabulary):
+        super().__init__()
+        self.audio_path = audio_path
+        self.project_dir = project_dir
+        self.settings = settings
+        self.model = model
+        self.language = language
+        self.vocabulary = vocabulary
+        self.result = None
+
+    def run(self):
+        from src.transcribe import transcribe
+        try:
+            self.result = transcribe(
+                audio_path=self.audio_path,
+                output_dir=self.project_dir,
+                asr_type=self.settings.asr_type,
+                model=self.model,
+                language=self.language,
+                vocabulary=self.vocabulary,
+                segment_length=self.settings.segment_length,
+                asr_api_url=self.settings.asr_api_url,
+                asr_api_key=self.settings.asr_api_key,
+                asr_cloud_model=self.settings.asr_cloud_model,
                 progress_cb=lambda v: self.progress.emit(v),
             )
             self.finished.emit(True, "")
