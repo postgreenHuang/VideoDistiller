@@ -65,6 +65,17 @@ def build_stylesheet(theme_name: str) -> str:
         background-color: {c['bg']};
     }}
 
+    /* ─── 对话框内所有容器 ─── */
+    QDialog QWidget {{
+        background-color: transparent;
+    }}
+    QDialog QGroupBox {{
+        background: {c['surface']};
+    }}
+    QDialog QGroupBox::title {{
+        background: {c['surface']};
+    }}
+
     /* ─── ListWidget ─── */
     QListWidget {{
         background: {c['surface']};
@@ -203,6 +214,11 @@ def build_stylesheet(theme_name: str) -> str:
         selection-color: #ffffff;
         padding: 2px;
         outline: none;
+    }}
+    QComboBox QLineEdit {{
+        background: {c['input_bg']};
+        color: {c['text']};
+        border: none;
     }}
 
     /* ─── Buttons ─── */
