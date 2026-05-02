@@ -48,8 +48,11 @@ class SettingsDialog(QDialog):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setStyleSheet("QScrollArea, QScrollArea > QWidget > QWidget { background: transparent; }")
+        scroll.viewport().setStyleSheet("background: transparent;")
 
         content = QWidget()
+        content.setStyleSheet("background: transparent;")
         layout = QVBoxLayout(content)
         layout.setSpacing(6)
         layout.setContentsMargins(0, 0, 4, 0)

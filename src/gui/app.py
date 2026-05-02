@@ -232,6 +232,7 @@ class MainWindow(QMainWindow):
         grid.addWidget(self.method_combo, 0, 1)
         self.btn_deduplicate = QPushButton("开始去重")
         self.btn_deduplicate.setFixedWidth(120)
+        self.btn_deduplicate.clicked.connect(self._start_deduplicate)
         grid.addWidget(self.btn_deduplicate, 0, 2)
 
         grid.addWidget(self._label("阈值"), 1, 0)
@@ -567,5 +568,75 @@ class _FFmpegWorker(QThread):
                     progress_cb=lambda v: self.progress.emit(v),
                 )
                 self.finished.emit(True, path)
+        except Exception as e:
+            self.finished.emit(False, str(e))
+
+    # ─── 图片去重: Step 2 按钮连接 ───
+
+    def _start_deduplicate(self):
+        output = self.output_dir_edit.text().strip()
+        if not output:
+            self.dedup_status.setText("请先设置输出目录")
+            return
+
+        # 查找 frames 目录
+        project_dir = Path(output)
+        if not project_dir.exists():
+            self.dedup_status.setText("输出目录不存在，请先完成帧提取")
+            return
+
+        frames_dir = project_dir / "frames"
+        if not frames_dir.exists() or not list(frames_dir.glob("*.jpg")):
+            self.dedup_status.setText("frames 目录为空，请先完成帧提取")
+            return
+
+        method = self.method_combo.currentText().lower()
+        threshold = self.threshold_slider.value() / 100.0
+
+        self.btn_deduplicate.setEnabled(False)
+        self.dedup_progress.setValue(0)
+        self.dedup_status.setText(f"正在去重 ({method}, 阈值 {threshold:.2f})...")
+
+        self._dedup_worker = _DedupWorker(
+            str(frames_dir), str(project_dir), method, threshold,
+        )
+        self._dedup_worker.progress.connect(lambda v: self.dedup_progress.setValue(int(v * 100)))
+        self._dedup_worker.finished.connect(self._on_dedup_done)
+        self._dedup_worker.start()
+
+    def _on_dedup_done(self, ok, result):
+        self.btn_deduplicate.setEnabled(True)
+        if ok:
+            self.dedup_progress.setValue(100)
+            r = self._dedup_worker.result
+            self.dedup_status.setText(
+                f"完成: {r['total']} 帧 → {r['kept']} 帧已保存到 {r['output']}"
+            )
+        else:
+            self.dedup_status.setText(f"失败: {result}")
+
+
+class _DedupWorker(QThread):
+    progress = Signal(float)
+    finished = Signal(bool, str)
+
+    def __init__(self, frames_dir, output_dir, method, threshold):
+        super().__init__()
+        self.frames_dir = frames_dir
+        self.output_dir = output_dir
+        self.method = method
+        self.threshold = threshold
+        self.result = None
+
+    def run(self):
+        from src.visual import deduplicate
+        try:
+            self.result = deduplicate(
+                self.frames_dir, self.output_dir,
+                method=self.method, threshold=self.threshold,
+                progress_cb=lambda v: self.progress.emit(v),
+            )
+            # 传递结果给主窗口
+            self.finished.emit(True, "")
         except Exception as e:
             self.finished.emit(False, str(e))

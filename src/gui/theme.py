@@ -304,6 +304,14 @@ def build_stylesheet(theme_name: str) -> str:
         background: transparent;
         border: none;
     }}
+    QScrollArea > QWidget > QWidget {{
+        background: transparent;
+    }}
+
+    /* ─── Tab 内容页 ─── */
+    QTabWidget::tab-bar {{
+        alignment: left;
+    }}
 
     /* ─── ScrollBar ─── */
     QScrollBar:vertical {{
