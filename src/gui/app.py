@@ -535,42 +535,6 @@ class MainWindow(QMainWindow):
         else:
             self.frame_status.setText(f"失败: {result}")
 
-
-class _FFmpegWorker(QThread):
-    progress = Signal(float)
-    finished = Signal(bool, str)
-
-    def __init__(self, task, video, output, **kwargs):
-        super().__init__()
-        self.task = task
-        self.video = video
-        self.output = output
-        self.kwargs = kwargs
-
-    def run(self):
-        from src.media import extract_audio, extract_frames
-        from src.config import get_project_dir
-        try:
-            project_dir = get_project_dir(self.output, self.video)
-            if self.task == "audio":
-                path = extract_audio(
-                    self.video, str(project_dir / "audio"),
-                    sample_rate=self.kwargs.get("sample_rate", 16000),
-                    progress_cb=lambda v: self.progress.emit(v),
-                )
-                self.finished.emit(True, path)
-            else:
-                res = self.kwargs.get("resolution_scale") or "1/2"
-                path = extract_frames(
-                    self.video, str(project_dir),
-                    fps=self.kwargs.get("fps", 1.0),
-                    resolution_scale=res,
-                    progress_cb=lambda v: self.progress.emit(v),
-                )
-                self.finished.emit(True, path)
-        except Exception as e:
-            self.finished.emit(False, str(e))
-
     # ─── 图片去重: Step 2 按钮连接 ───
 
     def _start_deduplicate(self):
@@ -579,7 +543,6 @@ class _FFmpegWorker(QThread):
             self.dedup_status.setText("请先设置输出目录")
             return
 
-        # 查找 frames 目录
         project_dir = Path(output)
         if not project_dir.exists():
             self.dedup_status.setText("输出目录不存在，请先完成帧提取")
@@ -616,6 +579,42 @@ class _FFmpegWorker(QThread):
             self.dedup_status.setText(f"失败: {result}")
 
 
+class _FFmpegWorker(QThread):
+    progress = Signal(float)
+    finished = Signal(bool, str)
+
+    def __init__(self, task, video, output, **kwargs):
+        super().__init__()
+        self.task = task
+        self.video = video
+        self.output = output
+        self.kwargs = kwargs
+
+    def run(self):
+        from src.media import extract_audio, extract_frames
+        from src.config import get_project_dir
+        try:
+            project_dir = get_project_dir(self.output, self.video)
+            if self.task == "audio":
+                path = extract_audio(
+                    self.video, str(project_dir / "audio"),
+                    sample_rate=self.kwargs.get("sample_rate", 16000),
+                    progress_cb=lambda v: self.progress.emit(v),
+                )
+                self.finished.emit(True, path)
+            else:
+                res = self.kwargs.get("resolution_scale") or "1/2"
+                path = extract_frames(
+                    self.video, str(project_dir),
+                    fps=self.kwargs.get("fps", 1.0),
+                    resolution_scale=res,
+                    progress_cb=lambda v: self.progress.emit(v),
+                )
+                self.finished.emit(True, path)
+        except Exception as e:
+            self.finished.emit(False, str(e))
+
+
 class _DedupWorker(QThread):
     progress = Signal(float)
     finished = Signal(bool, str)
@@ -636,7 +635,6 @@ class _DedupWorker(QThread):
                 method=self.method, threshold=self.threshold,
                 progress_cb=lambda v: self.progress.emit(v),
             )
-            # 传递结果给主窗口
             self.finished.emit(True, "")
         except Exception as e:
             self.finished.emit(False, str(e))
