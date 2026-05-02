@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, QThread, Signal
 from src.config import (
-    load_settings, Settings, RESOLUTION_SCALES, WHISPER_MODELS,
+    load_settings, save_settings, Settings, RESOLUTION_SCALES, WHISPER_MODELS,
     VISION_MODELS_OLLAMA, VISION_MODELS_CLOUD,
 )
 from src.gui.theme import build_stylesheet
@@ -104,6 +104,12 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(self._build_path_bar())
 
+        # 恢复上次路径
+        if self.settings.last_video_path:
+            self.video_path_edit.setText(self.settings.last_video_path)
+        if self.settings.last_output_dir:
+            self.output_dir_edit.setText(self.settings.last_output_dir)
+
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_step1(), "  Step 1  媒体提取  ")
         self.tabs.addTab(self._build_step2(), "  Step 2  图片去重  ")
@@ -151,11 +157,15 @@ class MainWindow(QMainWindow):
         )
         if path:
             self.video_path_edit.setText(path)
+            self.settings.last_video_path = path
+            save_settings(self.settings)
 
     def _browse_output(self):
         path = QFileDialog.getExistingDirectory(self, "选择输出目录")
         if path:
             self.output_dir_edit.setText(path)
+            self.settings.last_output_dir = path
+            save_settings(self.settings)
 
     # ─── Step 1: 媒体提取 ───
 

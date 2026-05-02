@@ -51,6 +51,8 @@ class VocabConfig:
 
 @dataclass
 class Settings:
+    last_video_path: str = ""
+    last_output_dir: str = ""
     theme: str = "dark"
     resolution_scale: str = "1/2"
     sample_rate: int = 16000
