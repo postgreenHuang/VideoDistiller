@@ -3,6 +3,7 @@ Video-Distiller 主窗口
 PySide6, Apple 风格, Light/Dark 主题, Settings 集成
 """
 
+import os
 from pathlib import Path
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -27,6 +28,15 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(build_stylesheet(self._theme))
         self._build_ui()
 
+    # ─── 项目路径自动推导 ───
+
+    def _get_project_dir(self) -> Path | None:
+        video = self.video_path_edit.text().strip()
+        output = self.output_dir_edit.text().strip()
+        if not video or not output:
+            return None
+        return Path(output) / Path(video).stem
+
     # ─── 主题切换 ───
 
     def _toggle_theme(self):
@@ -42,7 +52,7 @@ class MainWindow(QMainWindow):
 
     def _open_settings(self):
         dlg = SettingsDialog(self.settings, self)
-        if dlg.exec() == 1:  # QDialog.Accepted
+        if dlg.exec() == 1:
             self.settings = load_settings()
             if self.settings.theme != self._theme:
                 self._theme = self.settings.theme
@@ -62,7 +72,6 @@ class MainWindow(QMainWindow):
     # ─── 构建 UI ───
 
     def _build_ui(self):
-        # 工具栏
         toolbar = QToolBar()
         toolbar.setMovable(False)
         toolbar.setStyleSheet("border: none; padding: 0 4px;")
@@ -153,7 +162,6 @@ class MainWindow(QMainWindow):
         layout.setSpacing(8)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        # 音频
         ag = QGroupBox("音频提取")
         al = QGridLayout(ag)
         al.setSpacing(6)
@@ -175,7 +183,6 @@ class MainWindow(QMainWindow):
         al.addWidget(self.audio_status, 2, 0, 1, 3)
         layout.addWidget(ag)
 
-        # 帧
         fg = QGroupBox("帧提取")
         fl = QGridLayout(fg)
         fl.setSpacing(6)
@@ -347,36 +354,27 @@ class MainWindow(QMainWindow):
         layout.setSpacing(4)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        # 唯一的 GroupBox，内部分区
         g = QGroupBox("AI 聚合")
         gl = QVBoxLayout(g)
         gl.setSpacing(4)
         gl.setContentsMargins(12, 14, 12, 8)
 
-        # ── 第一行：数据源 + Provider ──
+        # 数据源状态（自动从项目目录读取）
         top = QGridLayout()
         top.setSpacing(6)
         top.setColumnStretch(1, 1)
 
         top.addWidget(self._label("图片数据"), 0, 0)
         self.slides_json_edit = QLineEdit()
-        self.slides_json_edit.setPlaceholderText("slides.json (图片理解结果)...")
+        self.slides_json_edit.setReadOnly(True)
+        self.slides_json_edit.setPlaceholderText("自动读取: {项目}/slides.json")
         top.addWidget(self.slides_json_edit, 0, 1)
-        btn_slides = QPushButton("浏览")
-        btn_slides.setProperty("class", "secondary")
-        btn_slides.setFixedWidth(72)
-        btn_slides.clicked.connect(lambda: self._browse_file(self.slides_json_edit, "JSON (*.json)"))
-        top.addWidget(btn_slides, 0, 2)
 
         top.addWidget(self._label("转录数据"), 1, 0)
         self.transcript_path_edit = QLineEdit()
-        self.transcript_path_edit.setPlaceholderText("transcript.json (语音转录)...")
+        self.transcript_path_edit.setReadOnly(True)
+        self.transcript_path_edit.setPlaceholderText("自动读取: {项目}/transcript/transcript.json")
         top.addWidget(self.transcript_path_edit, 1, 1)
-        btn_json = QPushButton("浏览")
-        btn_json.setProperty("class", "secondary")
-        btn_json.setFixedWidth(72)
-        btn_json.clicked.connect(lambda: self._browse_file(self.transcript_path_edit, "JSON (*.json)"))
-        top.addWidget(btn_json, 1, 2)
 
         top.addWidget(self._label("Provider"), 2, 0)
         prov_row = QHBoxLayout()
@@ -393,11 +391,11 @@ class MainWindow(QMainWindow):
         self.btn_export.setProperty("class", "secondary")
         self.btn_export.setFixedWidth(100)
         prov_row.addWidget(self.btn_export)
-        top.addLayout(prov_row, 2, 1, 1, 2)
+        top.addLayout(prov_row, 2, 1, 1, 1)
 
         gl.addLayout(top)
 
-        # ── 分隔：Prompt（API 模式才显示） ──
+        # Prompt（API 模式才显示）
         self.prompt_section = QWidget()
         pl = QVBoxLayout(self.prompt_section)
         pl.setContentsMargins(0, 4, 0, 0)
@@ -412,7 +410,7 @@ class MainWindow(QMainWindow):
         self.prompt_section.hide()
         gl.addWidget(self.prompt_section)
 
-        # ── 分隔：结果区 ──
+        # 结果区
         result_hdr = QHBoxLayout()
         result_hdr.setSpacing(6)
         self.result_label = QLabel("AI 返回结果（可手动粘贴）")
@@ -425,7 +423,7 @@ class MainWindow(QMainWindow):
         self.manual_result.setPlaceholderText("API 自动生成 或 手动粘贴 AI 笔记内容...")
         gl.addWidget(self.manual_result, stretch=1)
 
-        # ── 底部操作栏 ──
+        # 底部操作栏
         bottom = QHBoxLayout()
         bottom.setSpacing(6)
         bottom.addStretch()
@@ -439,23 +437,10 @@ class MainWindow(QMainWindow):
 
     def _on_provider_changed(self, index):
         self.prompt_section.setVisible(index != 0)
-        # 手动模式时隐藏"生成笔记"按钮，显示"导出数据"
         self.btn_generate.setVisible(index != 0)
         self.btn_export.setVisible(index == 0)
 
     # ─── 辅助 ───
-
-    def _browse_file(self, edit_widget, filter_str="所有文件 (*)"):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "选择文件", "", f"{filter_str};;所有文件 (*)"
-        )
-        if path:
-            edit_widget.setText(path)
-
-    def _browse_dir(self, edit_widget):
-        path = QFileDialog.getExistingDirectory(self, "选择文件夹")
-        if path:
-            edit_widget.setText(path)
 
     def _refresh_vocab_combo(self):
         self.vocab_combo.clear()
@@ -475,12 +460,11 @@ class MainWindow(QMainWindow):
         lbl.setStyleSheet("font-weight: 500; color: #48484a;")
         return lbl
 
-    # ─── 媒体处理: Step 1 按钮连接 ───
+    # ─── Step 1: 媒体处理 ───
 
     def _start_extract_audio(self):
-        video = self.video_path_edit.text().strip()
-        output = self.output_dir_edit.text().strip()
-        if not video or not output:
+        project_dir = self._get_project_dir()
+        if not project_dir:
             self.audio_status.setText("请先选择视频路径和输出目录")
             return
 
@@ -489,7 +473,7 @@ class MainWindow(QMainWindow):
         self.audio_status.setText("正在提取音频...")
 
         self._audio_worker = _FFmpegWorker(
-            "audio", video, output,
+            "audio", self.video_path_edit.text().strip(), str(project_dir),
             sample_rate=int(self.sample_rate_combo.currentText()),
         )
         self._audio_worker.progress.connect(lambda v: self.audio_progress.setValue(int(v * 100)))
@@ -505,9 +489,8 @@ class MainWindow(QMainWindow):
             self.audio_status.setText(f"失败: {result}")
 
     def _start_extract_frames(self):
-        video = self.video_path_edit.text().strip()
-        output = self.output_dir_edit.text().strip()
-        if not video or not output:
+        project_dir = self._get_project_dir()
+        if not project_dir:
             self.frame_status.setText("请先选择视频路径和输出目录")
             return
 
@@ -519,7 +502,7 @@ class MainWindow(QMainWindow):
         self.frame_status.setText("正在抽取帧...")
 
         self._frame_worker = _FFmpegWorker(
-            "frames", video, output,
+            "frames", self.video_path_edit.text().strip(), str(project_dir),
             fps=fps, resolution_scale=resolution if resolution != "原始" else None,
         )
         self._frame_worker.progress.connect(lambda v: self.frame_progress.setValue(int(v * 100)))
@@ -530,22 +513,17 @@ class MainWindow(QMainWindow):
         self.btn_extract_frames.setEnabled(True)
         if ok:
             self.frame_progress.setValue(100)
-            count = len([f for f in __import__('os').listdir(result) if f.endswith('.jpg')])
-            self.frame_status.setText(f"完成: {count} 帧已保存到 {result}")
+            count = len([f for f in os.listdir(result) if f.endswith('.jpg')])
+            self.frame_status.setText(f"完成: {count} 帧 → {result}")
         else:
             self.frame_status.setText(f"失败: {result}")
 
-    # ─── 图片去重: Step 2 按钮连接 ───
+    # ─── Step 2: 图片去重 ───
 
     def _start_deduplicate(self):
-        output = self.output_dir_edit.text().strip()
-        if not output:
-            self.dedup_status.setText("请先设置输出目录")
-            return
-
-        project_dir = Path(output)
-        if not project_dir.exists():
-            self.dedup_status.setText("输出目录不存在，请先完成帧提取")
+        project_dir = self._get_project_dir()
+        if not project_dir:
+            self.dedup_status.setText("请先选择视频路径和输出目录")
             return
 
         frames_dir = project_dir / "frames"
@@ -583,21 +561,21 @@ class _FFmpegWorker(QThread):
     progress = Signal(float)
     finished = Signal(bool, str)
 
-    def __init__(self, task, video, output, **kwargs):
+    def __init__(self, task, video, project_dir, **kwargs):
         super().__init__()
         self.task = task
         self.video = video
-        self.output = output
+        self.project_dir = project_dir
         self.kwargs = kwargs
 
     def run(self):
         from src.media import extract_audio, extract_frames
         from src.config import get_project_dir
         try:
-            project_dir = get_project_dir(self.output, self.video)
+            pd = get_project_dir(self.project_dir, self.video)
             if self.task == "audio":
                 path = extract_audio(
-                    self.video, str(project_dir / "audio"),
+                    self.video, str(pd / "audio"),
                     sample_rate=self.kwargs.get("sample_rate", 16000),
                     progress_cb=lambda v: self.progress.emit(v),
                 )
@@ -605,7 +583,7 @@ class _FFmpegWorker(QThread):
             else:
                 res = self.kwargs.get("resolution_scale") or "1/2"
                 path = extract_frames(
-                    self.video, str(project_dir),
+                    self.video, str(pd),
                     fps=self.kwargs.get("fps", 1.0),
                     resolution_scale=res,
                     progress_cb=lambda v: self.progress.emit(v),
@@ -619,10 +597,10 @@ class _DedupWorker(QThread):
     progress = Signal(float)
     finished = Signal(bool, str)
 
-    def __init__(self, frames_dir, output_dir, method, threshold):
+    def __init__(self, frames_dir, project_dir, method, threshold):
         super().__init__()
         self.frames_dir = frames_dir
-        self.output_dir = output_dir
+        self.project_dir = project_dir
         self.method = method
         self.threshold = threshold
         self.result = None
@@ -631,7 +609,7 @@ class _DedupWorker(QThread):
         from src.visual import deduplicate
         try:
             self.result = deduplicate(
-                self.frames_dir, self.output_dir,
+                self.frames_dir, self.project_dir,
                 method=self.method, threshold=self.threshold,
                 progress_cb=lambda v: self.progress.emit(v),
             )

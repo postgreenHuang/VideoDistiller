@@ -2,12 +2,11 @@
 Video-Distiller 图片去重模块
 - SSIM 相似度去重
 - pHash 感知哈希去重
-- 非破坏性迭代: key_frames/, key_frames_v2/, ...
+- 固定输出到 key_frames/，每次清空重写
 """
 
 import os
 import shutil
-from pathlib import Path
 from typing import Optional, Callable
 
 import cv2
@@ -24,14 +23,12 @@ def _list_frames(frames_dir: str) -> list[str]:
     )
 
 
-def _next_output_dir(parent_dir: str) -> str:
-    base = Path(parent_dir)
-    if not (base / "key_frames").exists():
-        return str(base / "key_frames")
-    i = 2
-    while (base / f"key_frames_v{i}").exists():
-        i += 1
-    return str(base / f"key_frames_v{i}")
+def _prepare_output(parent_dir: str) -> str:
+    out = os.path.join(parent_dir, "key_frames")
+    if os.path.exists(out):
+        shutil.rmtree(out)
+    os.makedirs(out)
+    return out
 
 
 # ─── SSIM 去重 ───
@@ -56,8 +53,7 @@ def dedup_ssim(
     if not frames:
         return {"total": 0, "kept": 0, "output": ""}
 
-    out_dir = _next_output_dir(output_dir)
-    os.makedirs(out_dir, exist_ok=True)
+    out_dir = _prepare_output(output_dir)
 
     kept: list[str] = [frames[0]]
     prev = cv2.imread(frames[0])
@@ -74,7 +70,6 @@ def dedup_ssim(
         if progress_cb:
             progress_cb(i / total)
 
-    # 复制保留的帧到输出目录
     for src in kept:
         shutil.copy2(src, os.path.join(out_dir, os.path.basename(src)))
 
@@ -103,14 +98,11 @@ def dedup_phash(
     threshold: float = 0.95,
     progress_cb: Optional[Callable[[float], None]] = None,
 ):
-    """threshold 0.95 → hamming distance < (1-0.95)*256 ≈ 12"""
     frames = _list_frames(frames_dir)
     if not frames:
         return {"total": 0, "kept": 0, "output": ""}
 
-    out_dir = _next_output_dir(output_dir)
-    os.makedirs(out_dir, exist_ok=True)
-
+    out_dir = _prepare_output(output_dir)
     max_dist = int((1.0 - threshold) * 256)
 
     kept: list[str] = [frames[0]]
