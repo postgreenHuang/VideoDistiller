@@ -634,6 +634,9 @@ class MainWindow(QMainWindow):
             )
         else:
             self.statusBar().showMessage(f"转录失败: {result}")
+
+
+class _FFmpegWorker(QThread):
     progress = Signal(float)
     finished = Signal(bool, str)
 
