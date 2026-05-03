@@ -4,18 +4,20 @@ PySide6, Apple 风格, Light/Dark 主题, Settings 集成
 """
 
 import os
+import time
+from datetime import datetime
 from pathlib import Path
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTabWidget, QLabel, QPushButton, QLineEdit,
-    QFileDialog, QComboBox, QSlider, QTextEdit,
+    QFileDialog, QComboBox, QTextEdit, QListWidget,
     QProgressBar, QGroupBox, QGridLayout, QToolBar,
-    QToolButton, QSpinBox,
+    QToolButton, QListView, QScrollArea,
 )
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt, QThread, Signal, QTimer
+from PySide6.QtGui import QDragEnterEvent, QDropEvent
 from src.config import (
-    load_settings, save_settings, Settings, RESOLUTION_SCALES, WHISPER_MODELS,
-    VISION_MODELS_OLLAMA, VISION_MODELS_CLOUD, ASR_CLOUD_MODELS,
+    load_settings, save_settings, Settings,
 )
 from src.gui.theme import build_stylesheet
 from src.gui.settings_dialog import SettingsDialog
@@ -48,10 +50,15 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(build_stylesheet(self._theme))
         self.theme_btn.setText("Light" if self._theme == "dark" else "Dark")
         self._update_dynamic_colors()
+        self._force_qt_combobox()
 
     def _update_dynamic_colors(self):
-        accent = "#0a84ff" if self._theme == "dark" else "#007aff"
-        self.threshold_label.setStyleSheet(f"font-weight: 600; font-size: 13px; color: {accent};")
+        pass
+
+    def _force_qt_combobox(self):
+        """强制 QComboBox 使用 Qt 内置弹窗渲染，使 QSS 完全生效"""
+        for combo in self.findChildren(QComboBox):
+            combo.setView(QListView())
 
     def _open_settings(self):
         dlg = SettingsDialog(self.settings, self)
@@ -64,13 +71,11 @@ class MainWindow(QMainWindow):
             self._refresh_from_settings()
 
     def _refresh_from_settings(self):
-        s = self.settings
-        idx = self.resolution_combo.findText(s.resolution_scale)
-        if idx >= 0:
-            self.resolution_combo.setCurrentIndex(idx)
-        self.sample_rate_combo.setCurrentText(str(s.sample_rate))
-        self._refresh_vocab_combo()
         self._refresh_provider_combo()
+        self._refresh_model_combo()
+        self._refresh_select_provider_combo()
+        self._refresh_vision_combo()
+        self._refresh_batch_combos()
 
     # ─── 构建 UI ───
 
@@ -102,22 +107,289 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(16, 8, 16, 8)
         layout.setSpacing(8)
 
-        layout.addWidget(self._build_path_bar())
+        self._build_path_bar_ref = self._build_path_bar()
 
-        # 恢复上次路径
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self._build_step1(), "  Step 1  媒体提取  ")
+        self.tabs.addTab(self._build_step2_transcribe(), "  Step 2  语音转录  ")
+        self.tabs.addTab(self._build_step3_select(), "  Step 3  智能选帧  ")
+        self.tabs.addTab(self._build_step_vision(), "  Step 4  图片理解  ")
+        self.tabs.addTab(self._build_step5(), "  Step 5  AI 聚合  ")
+
+        # 恢复上次路径（在所有 UI 构建之后）
         if self.settings.last_video_path:
             self.video_path_edit.setText(self.settings.last_video_path)
         if self.settings.last_output_dir:
             self.output_dir_edit.setText(self.settings.last_output_dir)
+        if self.settings.last_video_path and self.settings.last_output_dir:
+            self._auto_fill_step5_paths()
 
-        self.tabs = QTabWidget()
-        self.tabs.addTab(self._build_step1(), "  Step 1  媒体提取  ")
-        self.tabs.addTab(self._build_step2(), "  Step 2  图片去重  ")
-        self.tabs.addTab(self._build_step3(), "  Step 3  语音转录  ")
-        self.tabs.addTab(self._build_step4(), "  Step 4  AI 聚合  ")
-        layout.addWidget(self.tabs, stretch=1)
+        # 顶层两 Tab：蒸馏 + 对话
+        self.top_tabs = QTabWidget()
+        distill_page = QWidget()
+        distill_layout = QVBoxLayout(distill_page)
+        distill_layout.setContentsMargins(0, 0, 0, 0)
+        distill_layout.setSpacing(8)
+        distill_layout.addWidget(self._build_path_bar_ref)
+        distill_layout.addWidget(self.tabs, stretch=1)
 
-        self.statusBar().showMessage("就绪")
+        from src.gui.chat_widget import ChatWidget
+        self.chat_widget = ChatWidget()
+        self.top_tabs.addTab(distill_page, "  蒸馏  ")
+        self.top_tabs.addTab(self._build_batch_tab(), "  批量蒸馏  ")
+        self.top_tabs.addTab(self.chat_widget, "  对话  ")
+        self.top_tabs.currentChanged.connect(self._on_top_tab_changed)
+
+        layout.addWidget(self.top_tabs, stretch=1)
+
+        self._force_qt_combobox()
+        self._status_label = QLabel("就绪")
+        self._status_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+            | Qt.TextInteractionFlag.TextSelectableByKeyboard
+        )
+        self.statusBar().addPermanentWidget(self._status_label, stretch=1)
+
+        # 初始化模型下拉框
+        self._refresh_model_combo()
+        self._refresh_select_provider_combo()
+        self._refresh_vision_combo()
+
+    def _set_status(self, text: str):
+        self._status_label.setText(text)
+
+    def _on_top_tab_changed(self, index: int):
+        """切换到对话 Tab 时扫描 session 列表"""
+        if index != 2:
+            return
+
+        provider_config = {}
+        for p in self.settings.providers:
+            if p.get("api_key"):
+                provider_config = p
+                break
+
+        self.chat_widget.set_providers(self.settings.providers)
+        self.chat_widget.refresh_session_list(provider_config)
+
+    # ─── 批量蒸馏 Tab ───
+
+    def _build_batch_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setSpacing(8)
+        layout.setContentsMargins(16, 12, 16, 12)
+
+        # 顶部：输出目录（一行，无 GroupBox）
+        top = QHBoxLayout()
+        top.addWidget(self._label("输出目录"))
+        self.batch_output_edit = QLineEdit()
+        self.batch_output_edit.setPlaceholderText("选择输出目录...")
+        if self.settings.last_output_dir:
+            self.batch_output_edit.setText(self.settings.last_output_dir)
+        top.addWidget(self.batch_output_edit, stretch=1)
+        btn_out = QPushButton("浏览")
+        btn_out.setProperty("class", "secondary")
+        btn_out.setFixedWidth(56)
+        btn_out.clicked.connect(self._batch_browse_output)
+        top.addWidget(btn_out)
+        layout.addLayout(top)
+
+        # 中部：左（视频列表）+ 右（配置面板）
+        mid = QHBoxLayout()
+        mid.setSpacing(12)
+
+        # 左侧：视频列表
+        left = QVBoxLayout()
+        left.setSpacing(4)
+        left.addWidget(self._label("视频列表"))
+        self.batch_video_list = _DropListWidget()
+        left.addWidget(self.batch_video_list, stretch=1)
+        btn_row = QHBoxLayout()
+        btn_add = QPushButton("添加视频")
+        btn_add.clicked.connect(self._batch_add_videos)
+        btn_remove = QPushButton("移除")
+        btn_remove.setProperty("class", "secondary")
+        btn_remove.clicked.connect(self._batch_remove_selected)
+        btn_clear = QPushButton("清空")
+        btn_clear.setProperty("class", "secondary")
+        btn_clear.clicked.connect(self._batch_clear_videos)
+        btn_row.addWidget(btn_add)
+        btn_row.addWidget(btn_remove)
+        btn_row.addWidget(btn_clear)
+        left.addLayout(btn_row)
+        mid.addLayout(left, stretch=3)
+
+        # 右侧：模型选择（紧凑 Grid，无 GroupBox）
+        right = QVBoxLayout()
+        right.setSpacing(4)
+
+        model_grid = QGridLayout()
+        model_grid.setSpacing(6)
+        model_grid.setContentsMargins(0, 0, 0, 0)
+        model_grid.setColumnStretch(1, 1)
+
+        row = 0
+        model_grid.addWidget(self._label("语音转录"), row, 0)
+        self.batch_asr_combo = QComboBox()
+        model_grid.addWidget(self.batch_asr_combo, row, 1)
+
+        row += 1
+        model_grid.addWidget(self._label("智能选帧"), row, 0)
+        self.batch_select_combo = QComboBox()
+        model_grid.addWidget(self.batch_select_combo, row, 1)
+
+        row += 1
+        model_grid.addWidget(self._label("图片理解"), row, 0)
+        self.batch_vision_combo = QComboBox()
+        model_grid.addWidget(self.batch_vision_combo, row, 1)
+
+        row += 1
+        model_grid.addWidget(self._label("AI 聚合"), row, 0)
+        self.batch_agg_combo = QComboBox()
+        model_grid.addWidget(self.batch_agg_combo, row, 1)
+
+        right.addLayout(model_grid)
+
+        # 开始按钮
+        self.btn_batch_start = QPushButton("开始批量蒸馏")
+        self.btn_batch_start.clicked.connect(self._batch_start)
+        right.addWidget(self.btn_batch_start)
+
+        # 进度
+        self.batch_progress = QProgressBar()
+        right.addWidget(self.batch_progress)
+        self.batch_status = QLabel(" ")
+        self.batch_status.setProperty("class", "status")
+        self.batch_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        right.addWidget(self.batch_status)
+
+        right.addStretch()
+        mid.addLayout(right, stretch=2)
+
+        layout.addLayout(mid, stretch=1)
+
+        # 底部：运行日志（最大化纵向空间）
+        layout.addWidget(self._label("运行日志"))
+        self.batch_log = QTextEdit()
+        self.batch_log.setReadOnly(True)
+        self.batch_log.setPlaceholderText("运行日志...")
+        layout.addWidget(self.batch_log, stretch=2)
+
+        # 填充下拉框
+        self._refresh_batch_combos()
+
+        return page
+
+    def _refresh_batch_combos(self):
+        """填充批量蒸馏的 4 个模型下拉框"""
+        s = self.settings
+
+        # 语音转录
+        self.batch_asr_combo.clear()
+        if s.asr_type == "cloud":
+            for c in s.asr_cloud_configs:
+                self.batch_asr_combo.addItem(f"{c['name']} ({c['model']})", c)
+        else:
+            from src.config import WHISPER_MODELS
+            for m in WHISPER_MODELS:
+                self.batch_asr_combo.addItem(m, {"model": m, "type": "local"})
+
+        # 智能选帧
+        self.batch_select_combo.clear()
+        for p in s.providers:
+            if p.get("api_key"):
+                self.batch_select_combo.addItem(f"{p['name']} ({p['model']})", p)
+
+        # 图片理解
+        self.batch_vision_combo.clear()
+        for v in s.vision_models:
+            tag = "本地" if v["type"] == "ollama" else "云端"
+            self.batch_vision_combo.addItem(f"{v['name']} [{tag}]", v)
+
+        # AI 聚合
+        self.batch_agg_combo.clear()
+        for p in s.providers:
+            if p.get("api_key"):
+                self.batch_agg_combo.addItem(f"{p['name']} ({p['model']})", p)
+
+    def _batch_add_videos(self):
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "选择视频文件", "",
+            "视频文件 (*.mp4 *.mkv *.avi *.mov *.webm);;所有文件 (*)"
+        )
+        for p in paths:
+            self.batch_video_list.addItem(p)
+
+    def _batch_remove_selected(self):
+        for item in self.batch_video_list.selectedItems():
+            self.batch_video_list.takeItem(self.batch_video_list.row(item))
+
+    def _batch_clear_videos(self):
+        self.batch_video_list.clear()
+
+    def _batch_browse_output(self):
+        path = QFileDialog.getExistingDirectory(self, "选择输出目录")
+        if path:
+            self.batch_output_edit.setText(path)
+
+    def _batch_start(self):
+        if self.batch_video_list.count() == 0:
+            self.batch_log.append("请先添加视频文件")
+            return
+        output_dir = self.batch_output_edit.text().strip()
+        if not output_dir:
+            self.batch_log.append("请先选择输出目录")
+            return
+
+        videos = []
+        for i in range(self.batch_video_list.count()):
+            videos.append(self.batch_video_list.item(i).text())
+
+        asr_data = self.batch_asr_combo.currentData()
+        select_data = self.batch_select_combo.currentData()
+        vision_data = self.batch_vision_combo.currentData()
+        agg_data = self.batch_agg_combo.currentData()
+
+        if not select_data or not agg_data:
+            self.batch_log.append("请确保智能选帧和 AI 聚合的下拉框有可用的模型")
+            return
+
+        self.btn_batch_start.setText("停止")
+        self.btn_batch_start.clicked.disconnect()
+        self.btn_batch_start.clicked.connect(self._batch_stop)
+        self.batch_progress.setValue(0)
+        self.batch_log.clear()
+        self.batch_log.append(f"开始批量蒸馏: {len(videos)} 个视频\n")
+
+        self._batch_worker = _BatchWorker(
+            videos, output_dir, self.settings,
+            asr_data, select_data, vision_data, agg_data,
+        )
+        self._batch_worker.progress.connect(lambda v: self.batch_progress.setValue(int(v * 100)))
+        self._batch_worker.video_progress.connect(self._batch_on_video_progress)
+        self._batch_worker.log.connect(self._batch_on_log)
+        self._batch_worker.finished.connect(self._batch_on_done)
+        self._batch_worker.start()
+
+    def _batch_stop(self):
+        if hasattr(self, '_batch_worker') and self._batch_worker:
+            self._batch_worker._cancel = True
+            self.batch_log.append("\n正在停止...")
+
+    def _batch_on_log(self, msg: str):
+        self.batch_log.append(msg)
+
+    def _batch_on_video_progress(self, cur: int, total: int):
+        self.batch_status.setText(f"{cur}/{total} 视频")
+
+    def _batch_on_done(self, ok: bool, msg: str):
+        self.btn_batch_start.setText("开始批量蒸馏")
+        self.btn_batch_start.clicked.disconnect()
+        self.btn_batch_start.clicked.connect(self._batch_start)
+        self.batch_progress.setValue(100 if ok else self.batch_progress.value())
+        self.batch_log.append(f"\n{'全部完成' if ok else '已停止'}: {msg}")
+        self._batch_worker = None
 
     # ─── 顶部路径栏 ───
 
@@ -159,6 +431,7 @@ class MainWindow(QMainWindow):
             self.video_path_edit.setText(path)
             self.settings.last_video_path = path
             save_settings(self.settings)
+            self._auto_fill_step5_paths()
 
     def _browse_output(self):
         path = QFileDialog.getExistingDirectory(self, "选择输出目录")
@@ -166,6 +439,7 @@ class MainWindow(QMainWindow):
             self.output_dir_edit.setText(path)
             self.settings.last_output_dir = path
             save_settings(self.settings)
+            self._auto_fill_step5_paths()
 
     # ─── Step 1: 媒体提取 ───
 
@@ -175,183 +449,82 @@ class MainWindow(QMainWindow):
         layout.setSpacing(8)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        ag = QGroupBox("音频提取")
-        al = QGridLayout(ag)
-        al.setSpacing(6)
-        al.setContentsMargins(12, 14, 12, 8)
-        al.setColumnStretch(1, 1)
-        al.addWidget(self._label("采样率"), 0, 0)
-        self.sample_rate_combo = QComboBox()
-        self.sample_rate_combo.addItems(["8000", "16000", "22050", "44100"])
-        self.sample_rate_combo.setCurrentText(str(self.settings.sample_rate))
-        al.addWidget(self.sample_rate_combo, 0, 1)
-        self.btn_extract_audio = QPushButton("提取 MP3")
-        self.btn_extract_audio.setFixedWidth(120)
-        self.btn_extract_audio.clicked.connect(self._start_extract_audio)
-        al.addWidget(self.btn_extract_audio, 0, 2)
-        self.audio_progress = QProgressBar()
-        al.addWidget(self.audio_progress, 1, 0, 1, 3)
-        self.audio_status = QLabel(" ")
-        self.audio_status.setProperty("class", "status")
-        al.addWidget(self.audio_status, 2, 0, 1, 3)
-        layout.addWidget(ag)
-
-        fg = QGroupBox("帧提取")
-        fl = QGridLayout(fg)
-        fl.setSpacing(6)
-        fl.setContentsMargins(12, 14, 12, 8)
-        fl.setColumnStretch(1, 1)
-
-        fl.addWidget(self._label("抽帧间隔"), 0, 0)
-        self.fps_spin = QSpinBox()
-        self.fps_spin.setRange(1, 30)
-        self.fps_spin.setValue(1)
-        fl.addWidget(self.fps_spin, 0, 1)
-        fl.addWidget(self._label("帧/秒"), 0, 2)
-
-        fl.addWidget(self._label("分辨率"), 1, 0)
-        self.resolution_combo = QComboBox()
-        self.resolution_combo.addItems(["原始"] + RESOLUTION_SCALES)
-        ri = self.resolution_combo.findText(self.settings.resolution_scale)
-        if ri >= 0:
-            self.resolution_combo.setCurrentIndex(ri)
-        fl.addWidget(self.resolution_combo, 1, 1, 1, 2)
-
-        self.btn_extract_frames = QPushButton("抽取帧")
-        self.btn_extract_frames.setFixedWidth(120)
-        self.btn_extract_frames.clicked.connect(self._start_extract_frames)
-        fl.addWidget(self.btn_extract_frames, 0, 3, 2, 1)
-
-        self.frame_progress = QProgressBar()
-        fl.addWidget(self.frame_progress, 2, 0, 1, 4)
-        self.frame_status = QLabel(" ")
-        self.frame_status.setProperty("class", "status")
-        fl.addWidget(self.frame_status, 3, 0, 1, 4)
-        layout.addWidget(fg)
+        g = QGroupBox("媒体提取")
+        gl = QVBoxLayout(g)
+        gl.setSpacing(6)
+        gl.setContentsMargins(12, 14, 12, 8)
+        self.btn_extract = QPushButton("开始提取")
+        self.btn_extract.clicked.connect(self._start_extract)
+        gl.addWidget(self.btn_extract)
+        self.extract_progress = QProgressBar()
+        gl.addWidget(self.extract_progress)
+        self.extract_status = QLabel(" ")
+        self.extract_status.setProperty("class", "status")
+        gl.addWidget(self.extract_status)
+        layout.addWidget(g)
 
         layout.addStretch()
         return w
 
-    # ─── Step 2: 图片去重 ───
+    # ─── Step 2: 语音转录 (原 Step 3 提前) ───
 
-    def _build_step2(self):
+    def _build_step2_transcribe(self):
+        return self._build_step3_content()
+
+    # ─── Step 4: 图片理解 ───
+
+    def _build_step_vision(self):
         w = QWidget()
         layout = QVBoxLayout(w)
         layout.setSpacing(8)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        g = QGroupBox("去重设置")
-        grid = QGridLayout(g)
-        grid.setSpacing(6)
-        grid.setContentsMargins(12, 14, 12, 8)
-        grid.setColumnStretch(1, 1)
-
-        grid.addWidget(self._label("算法"), 0, 0)
-        self.method_combo = QComboBox()
-        self.method_combo.addItems(["SSIM", "pHash"])
-        grid.addWidget(self.method_combo, 0, 1)
-        self.btn_deduplicate = QPushButton("开始去重")
-        self.btn_deduplicate.setFixedWidth(120)
-        self.btn_deduplicate.clicked.connect(self._start_deduplicate)
-        grid.addWidget(self.btn_deduplicate, 0, 2)
-
-        grid.addWidget(self._label("阈值"), 1, 0)
-        self.threshold_slider = QSlider(Qt.Orientation.Horizontal)
-        self.threshold_slider.setRange(80, 99)
-        self.threshold_slider.setValue(int(self.settings.ssim_threshold * 100))
-        self.threshold_label = QLabel(f"{self.settings.ssim_threshold:.2f}")
-        self.threshold_label.setFixedWidth(36)
-        self.threshold_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.threshold_label.setStyleSheet("font-weight: 600; font-size: 13px; color: #007aff;")
-        self.threshold_slider.valueChanged.connect(
-            lambda v: self.threshold_label.setText(f"{v / 100:.2f}")
-        )
-        grid.addWidget(self.threshold_slider, 1, 1)
-        grid.addWidget(self.threshold_label, 1, 2)
-
-        self.dedup_progress = QProgressBar()
-        grid.addWidget(self.dedup_progress, 2, 0, 1, 3)
-        self.dedup_status = QLabel(" ")
-        self.dedup_status.setProperty("class", "status")
-        grid.addWidget(self.dedup_status, 3, 0, 1, 3)
-
-        layout.addWidget(g)
-
-        # 图片理解区
         vg = QGroupBox("图片理解")
-        vgrid = QGridLayout(vg)
-        vgrid.setSpacing(6)
-        vgrid.setContentsMargins(12, 14, 12, 8)
-        vgrid.setColumnStretch(1, 1)
-
-        vgrid.addWidget(self._label("视觉模型"), 0, 0)
+        vgl = QHBoxLayout(vg)
+        vgl.setSpacing(6)
+        vgl.setContentsMargins(12, 14, 12, 8)
+        vgl.addWidget(self._label("视觉模型"))
         self.vision_model_combo = QComboBox()
-        self.vision_model_combo.setEditable(True)
-        if self.settings.vision_type == "cloud":
-            self.vision_model_combo.addItems(VISION_MODELS_CLOUD)
-        else:
-            self.vision_model_combo.addItems(VISION_MODELS_OLLAMA)
-        self.vision_model_combo.setCurrentText(self.settings.vision_model)
-        vgrid.addWidget(self.vision_model_combo, 0, 1)
+        vgl.addWidget(self.vision_model_combo, stretch=1)
         self.btn_analyze = QPushButton("开始分析")
-        self.btn_analyze.setFixedWidth(120)
-        vgrid.addWidget(self.btn_analyze, 0, 2)
+        self.btn_analyze.clicked.connect(self._start_analyze)
+        vgl.addWidget(self.btn_analyze)
+        layout.addWidget(vg)
 
         self.analysis_progress = QProgressBar()
-        vgrid.addWidget(self.analysis_progress, 1, 0, 1, 3)
-        self.analysis_status = QLabel("需先完成去重，再分析关键帧 → 生成 slides.json")
+        layout.addWidget(self.analysis_progress)
+        self.token_label = QLabel(" ")
+        self.token_label.setProperty("class", "hint")
+        layout.addWidget(self.token_label)
+        self.analysis_status = QLabel("建议先完成 Step 3 选帧 + Step 2 转录，再分析关键帧")
         self.analysis_status.setProperty("class", "status")
-        vgrid.addWidget(self.analysis_status, 2, 0, 1, 3)
-
+        layout.addWidget(self.analysis_status)
         layout.addWidget(vg)
         layout.addStretch()
         return w
 
-    # ─── Step 3: 语音转录 ───
+    # ─── 转录 UI 构建 (Step 2 共用内容) ───
 
-    def _build_step3(self):
+    def _build_step3_content(self):
         w = QWidget()
         layout = QVBoxLayout(w)
         layout.setSpacing(8)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        g = QGroupBox("转录设置")
-        grid = QGridLayout(g)
-        grid.setSpacing(6)
-        grid.setContentsMargins(12, 14, 12, 8)
-        grid.setColumnStretch(1, 1)
-
-        grid.addWidget(self._label("模型"), 0, 0)
+        g = QGroupBox("语音转录")
+        gl = QHBoxLayout(g)
+        gl.setSpacing(6)
+        gl.setContentsMargins(12, 14, 12, 8)
+        gl.addWidget(self._label("模型"))
         self.model_combo = QComboBox()
-        if self.settings.asr_type == "cloud":
-            self.model_combo.addItems(ASR_CLOUD_MODELS)
-            self.model_combo.setCurrentText(self.settings.asr_cloud_model)
-        else:
-            self.model_combo.addItems(WHISPER_MODELS)
-            self.model_combo.setCurrentText(self.settings.whisper_model)
-        grid.addWidget(self.model_combo, 0, 1)
+        gl.addWidget(self.model_combo, stretch=1)
         self.btn_transcribe = QPushButton("开始转录")
-        self.btn_transcribe.setFixedWidth(120)
         self.btn_transcribe.clicked.connect(self._start_transcribe)
-        grid.addWidget(self.btn_transcribe, 0, 2)
-
-        grid.addWidget(self._label("语言"), 1, 0)
-        self.language_combo = QComboBox()
-        self.language_combo.addItems(["自动检测", "中文", "英文", "日文"])
-        grid.addWidget(self.language_combo, 1, 1)
-
-        grid.addWidget(self._label("词表"), 2, 0)
-        self.vocab_combo = QComboBox()
-        self.vocab_combo.addItem("无")
-        self._refresh_vocab_combo()
-        grid.addWidget(self.vocab_combo, 2, 1)
-        vocab_hint = QLabel("在 Settings > 术语词表 中管理")
-        vocab_hint.setProperty("class", "hint")
-        grid.addWidget(vocab_hint, 2, 2)
+        gl.addWidget(self.btn_transcribe)
+        layout.addWidget(g)
 
         self.transcribe_progress = QProgressBar()
-        grid.addWidget(self.transcribe_progress, 3, 0, 1, 3)
-        layout.addWidget(g)
+        layout.addWidget(self.transcribe_progress)
 
         rg = QGroupBox("转录预览")
         rl = QVBoxLayout(rg)
@@ -364,9 +537,62 @@ class MainWindow(QMainWindow):
 
         return w
 
-    # ─── Step 4: AI 聚合 ───
+    # ─── Step 3: AI 智能选帧 (新) ───
 
-    def _build_step4(self):
+    def _build_step3_select(self):
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setSpacing(8)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        g = QGroupBox("智能选帧")
+        gl = QHBoxLayout(g)
+        gl.setSpacing(6)
+        gl.setContentsMargins(12, 14, 12, 8)
+        gl.addWidget(self._label("AI 模型"))
+        self.select_provider_combo = QComboBox()
+        gl.addWidget(self.select_provider_combo, stretch=1)
+        self.btn_select_frames = QPushButton("开始选帧")
+        self.btn_select_frames.clicked.connect(self._start_select_frames)
+        gl.addWidget(self.btn_select_frames)
+        layout.addWidget(g)
+
+        self.select_progress = QProgressBar()
+        layout.addWidget(self.select_progress)
+        self.select_status = QLabel("需要先完成 Step 1 帧提取 + Step 2 转录")
+        self.select_status.setProperty("class", "status")
+        gl.addWidget(self.select_status)
+        layout.addWidget(g)
+
+        # 关键帧画廊
+        gallery_group = QGroupBox("关键帧预览")
+        gallery_layout = QVBoxLayout(gallery_group)
+        gallery_layout.setContentsMargins(4, 14, 4, 4)
+
+        self.gallery_scroll = QScrollArea()
+        self.gallery_scroll.setWidgetResizable(True)
+        self.gallery_scroll.setMinimumHeight(120)
+
+        self.gallery_container = QWidget()
+        self.gallery_grid = QHBoxLayout(self.gallery_container)
+        self.gallery_grid.setSpacing(4)
+        self.gallery_grid.setContentsMargins(8, 4, 8, 4)
+        self.gallery_grid.addStretch()
+
+        self.gallery_scroll.setWidget(self.gallery_container)
+        gallery_layout.addWidget(self.gallery_scroll)
+
+        self.gallery_count_label = QLabel("选帧完成后在此显示关键帧缩略图")
+        self.gallery_count_label.setProperty("class", "hint")
+        self.gallery_count_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        gallery_layout.addWidget(self.gallery_count_label)
+
+        layout.addWidget(gallery_group, stretch=1)
+        return w
+
+    # ─── Step 5: AI 聚合 ───
+
+    def _build_step5(self):
         w = QWidget()
         layout = QVBoxLayout(w)
         layout.setSpacing(4)
@@ -377,22 +603,30 @@ class MainWindow(QMainWindow):
         gl.setSpacing(4)
         gl.setContentsMargins(12, 14, 12, 8)
 
-        # 数据源状态（自动从项目目录读取）
+        # 数据源状态
         top = QGridLayout()
         top.setSpacing(6)
         top.setColumnStretch(1, 1)
 
         top.addWidget(self._label("图片数据"), 0, 0)
         self.slides_json_edit = QLineEdit()
-        self.slides_json_edit.setReadOnly(True)
         self.slides_json_edit.setPlaceholderText("自动读取: {项目}/slides.json")
         top.addWidget(self.slides_json_edit, 0, 1)
+        btn_slides = QPushButton("浏览")
+        btn_slides.setProperty("class", "secondary")
+        btn_slides.setFixedWidth(56)
+        btn_slides.clicked.connect(self._browse_slides_json)
+        top.addWidget(btn_slides, 0, 2)
 
         top.addWidget(self._label("转录数据"), 1, 0)
         self.transcript_path_edit = QLineEdit()
-        self.transcript_path_edit.setReadOnly(True)
         self.transcript_path_edit.setPlaceholderText("自动读取: {项目}/transcript/transcript.json")
         top.addWidget(self.transcript_path_edit, 1, 1)
+        btn_transcript = QPushButton("浏览")
+        btn_transcript.setProperty("class", "secondary")
+        btn_transcript.setFixedWidth(56)
+        btn_transcript.clicked.connect(self._browse_transcript_json)
+        top.addWidget(btn_transcript, 1, 2)
 
         top.addWidget(self._label("Provider"), 2, 0)
         prov_row = QHBoxLayout()
@@ -402,12 +636,14 @@ class MainWindow(QMainWindow):
         self._refresh_provider_combo()
         self.provider_combo.currentIndexChanged.connect(self._on_provider_changed)
         prov_row.addWidget(self.provider_combo, stretch=1)
-        self.btn_generate = QPushButton("生成笔记")
-        self.btn_generate.setFixedWidth(120)
+        self.btn_generate = QPushButton("生成笔记并开始对话")
+        self.btn_generate.setFixedWidth(160)
+        self.btn_generate.clicked.connect(self._start_generate)
         prov_row.addWidget(self.btn_generate)
         self.btn_export = QPushButton("导出数据")
         self.btn_export.setProperty("class", "secondary")
         self.btn_export.setFixedWidth(100)
+        self.btn_export.clicked.connect(self._on_export_data)
         prov_row.addWidget(self.btn_export)
         top.addLayout(prov_row, 2, 1, 1, 1)
 
@@ -428,27 +664,15 @@ class MainWindow(QMainWindow):
         self.prompt_section.hide()
         gl.addWidget(self.prompt_section)
 
-        # 结果区
-        result_hdr = QHBoxLayout()
-        result_hdr.setSpacing(6)
-        self.result_label = QLabel("AI 返回结果（可手动粘贴）")
-        self.result_label.setStyleSheet("font-weight: 500; font-size: 12px;")
-        result_hdr.addWidget(self.result_label)
-        result_hdr.addStretch()
-        gl.addLayout(result_hdr)
+        # 生成进度
+        self.generate_progress = QProgressBar()
+        self.generate_progress.setVisible(False)
+        gl.addWidget(self.generate_progress)
 
-        self.manual_result = QTextEdit()
-        self.manual_result.setPlaceholderText("API 自动生成 或 手动粘贴 AI 笔记内容...")
-        gl.addWidget(self.manual_result, stretch=1)
-
-        # 底部操作栏
-        bottom = QHBoxLayout()
-        bottom.setSpacing(6)
-        bottom.addStretch()
-        self.btn_save_md = QPushButton("保存 Markdown (.md)")
-        self.btn_save_md.setFixedWidth(180)
-        bottom.addWidget(self.btn_save_md)
-        gl.addLayout(bottom)
+        # 状态提示
+        self.generate_status = QLabel()
+        self.generate_status.setProperty("class", "hint")
+        gl.addWidget(self.generate_status)
 
         layout.addWidget(g)
         return w
@@ -458,19 +682,203 @@ class MainWindow(QMainWindow):
         self.btn_generate.setVisible(index != 0)
         self.btn_export.setVisible(index == 0)
 
-    # ─── 辅助 ───
+    def _on_export_data(self):
+        """手动模式：将 slides + transcript 合并为 Markdown 导出到剪贴板"""
+        slides_path = self.slides_json_edit.text().strip()
+        transcript_path = self.transcript_path_edit.text().strip()
+        if not slides_path and not transcript_path:
+            self.generate_status.setText("没有可用的数据源")
+            return
 
-    def _refresh_vocab_combo(self):
-        self.vocab_combo.clear()
-        self.vocab_combo.addItem("无")
-        for v in self.settings.vocabularies:
-            self.vocab_combo.addItem(v["name"])
+        from pathlib import Path
+        parts = []
+        if slides_path and os.path.exists(slides_path):
+            data = json.loads(Path(slides_path).read_text(encoding="utf-8"))
+            slides = data.get("slides", [])
+            parts.append("## 幻灯片描述\n")
+            for s in slides:
+                ts = s.get("timestamp", "")
+                title = s.get("title", "")
+                text = s.get("text", "")
+                diagrams = s.get("diagrams", "")
+                line = f"[{ts}] **{title}**"
+                if text:
+                    line += f"\n{text}"
+                if diagrams and diagrams != "无":
+                    line += f"\n图表: {diagrams}"
+                parts.append(line + "\n")
+
+        if transcript_path and os.path.exists(transcript_path):
+            data = json.loads(Path(transcript_path).read_text(encoding="utf-8"))
+            segments = data.get("segments", [])
+            parts.append("\n## 语音转录\n")
+            for seg in segments:
+                start = seg.get("start", 0)
+                m, s = int(start) // 60, int(start) % 60
+                parts.append(f"[{m:02d}:{s:02d}] {seg.get('text', '')}\n")
+
+        if not parts:
+            self.generate_status.setText("没有可导出的内容")
+            return
+
+        combined = "\n".join(parts)
+        from PySide6.QtWidgets import QApplication
+        QApplication.clipboard().setText(combined)
+        self.generate_status.setText(f"已复制到剪贴板 ({len(combined)} 字符)，可粘贴到 AI 网页版")
+
+    def _start_generate(self):
+        """调用 AI 生成蒸馏笔记，创建对话 session，跳转到对话 Tab"""
+        index = self.provider_combo.currentIndex()
+        if index <= 0:
+            return
+
+        provider_data = self.provider_combo.itemData(index)
+        if not provider_data:
+            return
+
+        video_path = self.video_path_edit.text().strip()
+        output_dir = self.output_dir_edit.text().strip()
+        if not video_path or not output_dir:
+            self.generate_status.setText("请先设置视频路径和输出目录")
+            return
+
+        from src.config import get_project_dir
+        project_dir = str(get_project_dir(output_dir, video_path))
+
+        slides_path = self.slides_json_edit.text().strip()
+        transcript_path = self.transcript_path_edit.text().strip()
+        prompt = self.prompt_edit.toPlainText().strip()
+        if not prompt:
+            prompt = self.settings.default_distill_prompt
+
+        if not slides_path and not transcript_path:
+            self.generate_status.setText("没有可用的数据源，请先完成前面的步骤")
+            return
+
+        self.btn_generate.setEnabled(False)
+        self.generate_status.setText("正在生成笔记 0s...")
+        self.generate_progress.setVisible(True)
+        self.generate_progress.setRange(0, 0)
+        self._gen_start_time = time.time()
+        self._gen_timer = QTimer(self)
+        self._gen_timer.timeout.connect(self._tick_gen_timer)
+        self._gen_timer.start(1000)
+
+        video_name = os.path.splitext(os.path.basename(video_path))[0]
+        self._generate_worker = _GenerateWorker(
+            provider_data, prompt, slides_path, transcript_path,
+            project_dir, video_name,
+        )
+        self._generate_worker.finished.connect(self._on_generate_done)
+        self._generate_worker.error.connect(self._on_generate_error)
+        self._generate_worker.start()
+
+    def _tick_gen_timer(self):
+        elapsed = int(time.time() - self._gen_start_time)
+        m, s = divmod(elapsed, 60)
+        self.generate_status.setText(
+            f"正在生成笔记 {m}m{s:02d}s..." if m else f"正在生成笔记 {s}s..."
+        )
+
+    def _on_generate_done(self, notes_path: str):
+        self._gen_timer.stop()
+        elapsed = int(time.time() - self._gen_start_time)
+        m, s = divmod(elapsed, 60)
+        t = f"{m}m{s:02d}s" if m else f"{s}s"
+        self.btn_generate.setEnabled(True)
+        self.generate_progress.setVisible(False)
+        self.generate_status.setText(f"笔记已保存: {os.path.basename(notes_path)} ({t})")
+        # 跳转到对话 Tab
+        self.top_tabs.setCurrentIndex(2)
+        self.chat_widget.set_providers(self.settings.providers)
+        provider_config = {}
+        for p in self.settings.providers:
+            if p.get("api_key"):
+                provider_config = p
+                break
+        self.chat_widget.refresh_session_list(provider_config)
+        # 选中最新的 session
+        if self.chat_widget.project_list.count() > 0:
+            self.chat_widget.project_list.setCurrentRow(0)
+
+    def _on_generate_error(self, err: str):
+        self._gen_timer.stop()
+        self.btn_generate.setEnabled(True)
+        self.generate_progress.setVisible(False)
+        self.generate_status.setText(f"生成失败: {err}")
+
+    # ─── Step 5 数据源 ───
+
+    def _browse_slides_json(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择 slides.json", "", "JSON (*.json)"
+        )
+        if path:
+            self.slides_json_edit.setText(path)
+
+    def _browse_transcript_json(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择 transcript.json", "", "JSON (*.json)"
+        )
+        if path:
+            self.transcript_path_edit.setText(path)
+
+    def _auto_fill_step5_paths(self):
+        video_path = self.video_path_edit.text().strip()
+        output_dir = self.output_dir_edit.text().strip()
+        if not video_path or not output_dir:
+            return
+        project_dir = Path(output_dir) / Path(video_path).stem
+        slides_json = project_dir / "slides.json"
+        transcript_json = project_dir / "transcript" / "transcript.json"
+        if slides_json.exists():
+            self.slides_json_edit.setText(str(slides_json))
+        if transcript_json.exists():
+            self.transcript_path_edit.setText(str(transcript_json))
+
+    # ─── 辅助 ───
 
     def _refresh_provider_combo(self):
         self.provider_combo.clear()
         self.provider_combo.addItem("手动模式")
         for p in self.settings.providers:
-            self.provider_combo.addItem(f"{p['name']} ({p['model']})")
+            self.provider_combo.addItem(f"{p['name']} ({p['model']})", p)
+
+    def _refresh_model_combo(self):
+        self.model_combo.clear()
+        if self.settings.asr_type == "cloud":
+            for c in self.settings.asr_cloud_configs:
+                self.model_combo.addItem(f"{c['name']} ({c['model']})")
+            for i, c in enumerate(self.settings.asr_cloud_configs):
+                if c["name"] == self.settings.asr_cloud_active:
+                    self.model_combo.setCurrentIndex(i)
+                    break
+        else:
+            from src.config import WHISPER_MODELS
+            self.model_combo.addItems(WHISPER_MODELS)
+            idx = self.model_combo.findText(self.settings.whisper_model)
+            if idx >= 0:
+                self.model_combo.setCurrentIndex(idx)
+
+    def _refresh_select_provider_combo(self):
+        if not hasattr(self, 'select_provider_combo'):
+            return
+        self.select_provider_combo.clear()
+        for p in self.settings.providers:
+            if p.get("api_key"):
+                self.select_provider_combo.addItem(f"{p['name']} ({p['model']})", p)
+
+    def _refresh_vision_combo(self):
+        if not hasattr(self, 'vision_model_combo'):
+            return
+        self.vision_model_combo.clear()
+        for v in self.settings.vision_models:
+            tag = "本地" if v["type"] == "ollama" else "云端"
+            self.vision_model_combo.addItem(f"{v['name']} [{tag}]", v)
+        for i, v in enumerate(self.settings.vision_models):
+            if v.get("name") == self.settings.vision_active:
+                self.vision_model_combo.setCurrentIndex(i)
+                break
 
     @staticmethod
     def _label(text):
@@ -478,142 +886,314 @@ class MainWindow(QMainWindow):
         lbl.setStyleSheet("font-weight: 500; color: #48484a;")
         return lbl
 
-    # ─── Step 1: 媒体处理 ───
+    # ─── Step 1: 媒体处理 (音频 → 帧自动链式执行) ───
 
-    def _start_extract_audio(self):
+    def _start_extract(self):
         project_dir = self._get_project_dir()
         if not project_dir:
-            self.audio_status.setText("请先选择视频路径和输出目录")
+            self.extract_status.setText("请先选择视频路径和输出目录")
             return
 
-        self.btn_extract_audio.setEnabled(False)
-        self.audio_progress.setValue(0)
-        self.audio_status.setText("正在提取音频...")
+        self.btn_extract.setEnabled(False)
+        self.extract_progress.setValue(0)
+        self.extract_status.setText("正在提取音频...")
 
         self._audio_worker = _FFmpegWorker(
             "audio", self.video_path_edit.text().strip(), str(project_dir),
-            sample_rate=int(self.sample_rate_combo.currentText()),
+            sample_rate=self.settings.sample_rate,
         )
-        self._audio_worker.progress.connect(lambda v: self.audio_progress.setValue(int(v * 100)))
-        self._audio_worker.finished.connect(self._on_audio_done)
+        self._audio_worker.progress.connect(lambda v: self.extract_progress.setValue(int(v * 50)))
+        self._audio_worker.finished.connect(self._on_audio_done_chain)
         self._audio_worker.start()
 
-    def _on_audio_done(self, ok, result):
-        self.btn_extract_audio.setEnabled(True)
-        if ok:
-            self.audio_progress.setValue(100)
-            self.audio_status.setText(f"完成: {result}")
-        else:
-            self.audio_status.setText(f"失败: {result}")
-
-    def _start_extract_frames(self):
-        project_dir = self._get_project_dir()
-        if not project_dir:
-            self.frame_status.setText("请先选择视频路径和输出目录")
+    def _on_audio_done_chain(self, ok, result):
+        if not ok:
+            self.btn_extract.setEnabled(True)
+            self.extract_status.setText(f"音频提取失败: {result}")
             return
-
-        resolution = self.resolution_combo.currentText()
-        fps = self.fps_spin.value()
-
-        self.btn_extract_frames.setEnabled(False)
-        self.frame_progress.setValue(0)
-        self.frame_status.setText("正在抽取帧...")
-
+        self.extract_status.setText("音频完成，正在抽取帧...")
+        self._extract_project_dir = self._get_project_dir()
         self._frame_worker = _FFmpegWorker(
-            "frames", self.video_path_edit.text().strip(), str(project_dir),
-            fps=fps, resolution_scale=resolution if resolution != "原始" else None,
+            "frames", self.video_path_edit.text().strip(), str(self._extract_project_dir),
+            fps=1.0 / self.settings.frame_interval if self.settings.frame_interval > 0 else 1.0,
+            resolution_scale=self.settings.resolution_scale,
         )
-        self._frame_worker.progress.connect(lambda v: self.frame_progress.setValue(int(v * 100)))
-        self._frame_worker.finished.connect(self._on_frames_done)
+        self._frame_worker.progress.connect(lambda v: self.extract_progress.setValue(50 + int(v * 50)))
+        self._frame_worker.finished.connect(self._on_frames_done_chain)
         self._frame_worker.start()
 
-    def _on_frames_done(self, ok, result):
-        self.btn_extract_frames.setEnabled(True)
+    def _on_frames_done_chain(self, ok, result):
+        self.btn_extract.setEnabled(True)
         if ok:
-            self.frame_progress.setValue(100)
+            self.extract_progress.setValue(100)
             count = len([f for f in os.listdir(result) if f.endswith('.jpg')])
-            self.frame_status.setText(f"完成: {count} 帧 → {result}")
+            self.extract_status.setText(f"完成: 音频 + {count} 帧")
         else:
-            self.frame_status.setText(f"失败: {result}")
+            self.extract_status.setText(f"帧提取失败: {result}")
 
-    # ─── Step 2: 图片去重 ───
+    # ─── Step 3: AI 智能选帧 ───
 
-    def _start_deduplicate(self):
+    def _start_select_frames(self):
         project_dir = self._get_project_dir()
         if not project_dir:
-            self.dedup_status.setText("请先选择视频路径和输出目录")
+            self.select_status.setText("请先选择视频路径和输出目录")
             return
 
         frames_dir = project_dir / "frames"
+        transcript_path = project_dir / "transcript" / "transcript.json"
+
         if not frames_dir.exists() or not list(frames_dir.glob("*.jpg")):
-            self.dedup_status.setText("frames 目录为空，请先完成帧提取")
+            self.select_status.setText("frames 目录为空，请先完成 Step 1 帧提取")
             return
 
-        method = self.method_combo.currentText().lower()
-        threshold = self.threshold_slider.value() / 100.0
+        if not transcript_path.exists():
+            self.select_status.setText("未找到 transcript.json，请先完成 Step 2 转录")
+            return
 
-        self.btn_deduplicate.setEnabled(False)
-        self.dedup_progress.setValue(0)
-        self.dedup_status.setText(f"正在去重 ({method}, 阈值 {threshold:.2f})...")
+        # 从下拉框获取选中的 provider
+        provider_data = self.select_provider_combo.currentData()
+        if not provider_data or not provider_data.get("api_key"):
+            self.select_status.setText("请先在 Settings 中配置 AI Provider 的 Key")
+            return
 
-        self._dedup_worker = _DedupWorker(
-            str(frames_dir), str(project_dir), method, threshold,
+        self.btn_select_frames.setEnabled(False)
+        self.select_progress.setValue(0)
+        self.select_status.setText("正在分析转录文本，选取关键帧...")
+
+        self._frame_select_worker = _FrameSelectWorker(
+            str(transcript_path), str(frames_dir), str(project_dir),
+            provider_data,
         )
-        self._dedup_worker.progress.connect(lambda v: self.dedup_progress.setValue(int(v * 100)))
-        self._dedup_worker.finished.connect(self._on_dedup_done)
-        self._dedup_worker.start()
+        self._frame_select_worker.progress.connect(
+            lambda v: self.select_progress.setValue(int(v * 100))
+        )
+        self._frame_select_worker.finished.connect(self._on_select_frames_done)
+        self._frame_select_worker.start()
 
-    def _on_dedup_done(self, ok, result):
-        self.btn_deduplicate.setEnabled(True)
-        if ok:
-            self.dedup_progress.setValue(100)
-            r = self._dedup_worker.result
-            self.dedup_status.setText(
-                f"完成: {r['total']} 帧 → {r['kept']} 帧已保存到 {r['output']}"
+    def _on_select_frames_done(self, ok, result):
+        self.btn_select_frames.setEnabled(True)
+        if ok and self._frame_select_worker.result:
+            r = self._frame_select_worker.result
+            self.select_progress.setValue(100)
+            self.select_status.setText(
+                f"完成: 从 {r['total']} 帧中选出 {r['selected']} 帧关键帧"
             )
+            self._load_gallery(r['output'])
         else:
-            self.dedup_status.setText(f"失败: {result}")
+            self.select_status.setText(f"失败: {result}")
+
+    def _load_gallery(self, key_frames_dir: str):
+        """加载关键帧缩略图到画廊"""
+        # 清空旧内容
+        while self.gallery_grid.count() > 1:
+            item = self.gallery_grid.takeAt(0)
+            w = item.widget()
+            if w:
+                w.setParent(None)
+                w.deleteLater()
+
+        if not key_frames_dir or not os.path.isdir(key_frames_dir):
+            self.gallery_count_label.setText("未找到关键帧目录")
+            return
+
+        from PySide6.QtWidgets import QLabel as ImgLabel
+        from PySide6.QtGui import QPixmap
+        from PySide6.QtCore import Qt
+
+        frames = sorted(Path(key_frames_dir).glob("*.jpg"))
+        if not frames:
+            self.gallery_count_label.setText("关键帧目录为空")
+            return
+
+        thumb_size = 120
+        for fp in frames:
+            thumb = ImgLabel()
+            thumb.setFixedSize(thumb_size, int(thumb_size * 9 / 16))
+            thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            thumb.setProperty("class", "gallery-thumb")
+            pix = QPixmap(str(fp))
+            if not pix.isNull():
+                thumb.setPixmap(pix.scaled(
+                    thumb.size(), Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                    Qt.TransformationMode.SmoothTransformation,
+                ))
+            thumb.setToolTip(f"{fp.name}")
+            # 点击放大
+            thumb.mousePressEvent = lambda e, p=str(fp): self._show_full_image(p)
+            idx = self.gallery_grid.count() - 1
+            self.gallery_grid.insertWidget(idx, thumb)
+
+        self.gallery_count_label.setText(f"{len(frames)} 张关键帧（点击放大）")
+
+    def _show_full_image(self, image_path: str):
+        """弹出窗口显示完整图片"""
+        from PySide6.QtWidgets import QDialog, QVBoxLayout, QLabel, QScrollArea
+        from PySide6.QtGui import QPixmap
+        from PySide6.QtCore import Qt
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(os.path.basename(image_path))
+        dlg.resize(1000, 600)
+
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        label = QLabel()
+        pix = QPixmap(image_path)
+        label.setPixmap(pix)
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        scroll.setWidget(label)
+        layout.addWidget(scroll)
+
+        dlg.exec()
+
+    # ─── Step 4: 图片理解 ───
+
+    def _start_analyze(self):
+        # 如果正在运行，则停止
+        if hasattr(self, "_vision_worker") and self._vision_worker is not None and self._vision_worker.isRunning():
+            self._vision_worker.cancel()
+            return
+
+        project_dir = self._get_project_dir()
+        if not project_dir:
+            self.analysis_status.setText("请先选择视频路径和输出目录")
+            return
+
+        key_frames_dir = project_dir / "key_frames"
+        if not key_frames_dir.exists() or not list(key_frames_dir.glob("*.jpg")):
+            self.analysis_status.setText("key_frames 目录为空，请先完成 Step 3 智能选帧")
+            return
+
+        # 从下拉框获取视觉模型配置
+        s = self.settings
+        vision_config = self.vision_model_combo.currentData()
+        if not vision_config:
+            self.analysis_status.setText("请先在 Settings 中配置视觉模型")
+            return
+        vision_config = dict(vision_config)
+        if not vision_config.get("url"):
+            vision_config["url"] = s.ollama_url
+
+        prompts = {
+            "ocr": s.vision_prompt_ocr,
+            "diagram": s.vision_prompt_diagram,
+            "title": s.vision_prompt_title,
+            "single": s.vision_prompt_single,
+        }
+
+        # 尝试加载 transcript.json 作为上下文
+        transcript_segments = []
+        transcript_path = project_dir / "transcript" / "transcript.json"
+        if transcript_path.exists():
+            import json
+            try:
+                with open(transcript_path, "r", encoding="utf-8") as f:
+                    tdata = json.load(f)
+                transcript_segments = tdata.get("segments", [])
+            except Exception:
+                pass
+
+        self.analysis_progress.setValue(0)
+        self.token_label.setText(" ")
+        self.analysis_status.setText(
+            f"正在分析 ({vision_config['model']})..."
+        )
+        self.btn_analyze.setText("停止分析")
+
+        self._vision_worker = _VisionWorker(
+            str(key_frames_dir), str(project_dir), vision_config, prompts,
+            transcript_segments,
+        )
+        self._vision_worker.progress.connect(
+            lambda v: self.analysis_progress.setValue(int(v * 100))
+        )
+        self._vision_worker.token_update.connect(self._on_token_update)
+        self._vision_worker.finished.connect(self._on_analyze_done)
+        self._vision_worker.start()
+
+    def _on_analyze_done(self, ok, result):
+        self.btn_analyze.setText("开始分析")
+        r = self._vision_worker.result if self._vision_worker else None
+        self._vision_worker = None
+        if ok and r:
+            suffix = " (已提前停止)" if r.get("cancelled") else ""
+            self.analysis_progress.setValue(100)
+            self.analysis_status.setText(
+                f"完成{suffix}: {r['total_slides']} 张关键帧 → {r['output']}"
+            )
+            self._auto_fill_step5_paths()
+        else:
+            self.analysis_status.setText(f"失败: {result}")
+
+    def _on_token_update(self, tokens: dict):
+        p = tokens.get("prompt", 0)
+        c = tokens.get("completion", 0)
+        t = tokens.get("total", 0)
+        calls = tokens.get("calls", 0)
+        self.token_label.setText(
+            f"Token: {p:,} prompt + {c:,} completion = {t:,} total  |  API 调用: {calls}"
+        )
 
     # ─── Step 3: 语音转录 ───
 
     def _start_transcribe(self):
         project_dir = self._get_project_dir()
         if not project_dir:
-            self.statusBar().showMessage("请先选择视频路径和输出目录")
+            self._set_status("请先选择视频路径和输出目录")
             return
 
         # 查找音频文件
         audio_dir = project_dir / "audio"
         if not audio_dir.exists():
-            self.statusBar().showMessage("请先完成音频提取 (Step 1)")
+            self._set_status("请先完成音频提取 (Step 1)")
             return
         mp3_files = list(audio_dir.glob("*.mp3"))
         if not mp3_files:
-            self.statusBar().showMessage("未找到 MP3 文件，请先完成音频提取")
+            self._set_status("未找到 MP3 文件，请先完成音频提取")
             return
         audio_path = str(mp3_files[0])
 
-        # 获取参数
-        model = self.model_combo.currentText()
-        lang_map = {"自动检测": None, "中文": "zh", "英文": "en", "日文": "ja"}
-        language = lang_map.get(self.language_combo.currentText())
+        # 从 settings 获取 ASR 配置
+        s = self.settings
+        asr_type = s.asr_type
+        language = s.whisper_language if s.whisper_language else None
 
-        # 获取词表
-        vocabulary = None
-        vocab_name = self.vocab_combo.currentText()
-        if vocab_name != "无":
-            for v in self.settings.vocabularies:
-                if v["name"] == vocab_name:
-                    vocabulary = v["terms"]
+        if asr_type == "cloud":
+            cloud_config = None
+            for c in s.asr_cloud_configs:
+                if c["name"] == s.asr_cloud_active:
+                    cloud_config = c
                     break
+            if not cloud_config and s.asr_cloud_configs:
+                cloud_config = s.asr_cloud_configs[0]
+            if not cloud_config:
+                self._set_status("请先在 Settings 中配置云端 ASR")
+                return
+            model = cloud_config["model"]
+            asr_api_url = cloud_config["base_url"]
+            asr_api_key = cloud_config["api_key"]
+            asr_api_type = cloud_config.get("api_type", "whisper")
+        else:
+            model = s.whisper_model
+            asr_api_url = ""
+            asr_api_key = ""
+            asr_api_type = "whisper"
+
+        # 使用第一个词表
+        vocabulary = s.vocabularies[0]["terms"] if s.vocabularies else None
 
         self.btn_transcribe.setEnabled(False)
         self.transcribe_progress.setValue(0)
-        self.statusBar().showMessage(f"正在转录 ({model})...")
+        self._set_status(f"正在转录 ({model})...")
 
         self._transcribe_worker = _TranscribeWorker(
-            audio_path, str(project_dir), self.settings,
-            model, language, vocabulary,
+            audio_path, str(project_dir), asr_type,
+            model, language, vocabulary, s.segment_length,
+            asr_api_url, asr_api_key, asr_api_type,
+            progress_cb=lambda v: self.transcribe_progress.setValue(int(v * 100)),
         )
         self._transcribe_worker.progress.connect(lambda v: self.transcribe_progress.setValue(int(v * 100)))
         self._transcribe_worker.finished.connect(self._on_transcribe_done)
@@ -627,13 +1207,13 @@ class MainWindow(QMainWindow):
             from src.transcribe import build_preview_text
             self.transcript_preview.setPlainText(build_preview_text(r["segments"]))
             meta = r["metadata"]
-            self.statusBar().showMessage(
+            self._set_status(
                 f"转录完成: {meta['total_segments']} 段, "
                 f"{meta['total_chars']} 字 "
                 f"({meta['asr_type']}, {meta['model']})"
             )
         else:
-            self.statusBar().showMessage(f"转录失败: {result}")
+            self._set_status(f"转录失败: {result}")
 
 
 class _FFmpegWorker(QThread):
@@ -649,9 +1229,12 @@ class _FFmpegWorker(QThread):
 
     def run(self):
         from src.media import extract_audio, extract_frames
-        from src.config import get_project_dir
         try:
-            pd = get_project_dir(self.project_dir, self.video)
+            pd = Path(self.project_dir)
+            pd.mkdir(parents=True, exist_ok=True)
+            for sub in ("audio", "frames", "key_frames", "transcript", "notes"):
+                (pd / sub).mkdir(exist_ok=True)
+
             if self.task == "audio":
                 path = extract_audio(
                     self.video, str(pd / "audio"),
@@ -672,24 +1255,24 @@ class _FFmpegWorker(QThread):
             self.finished.emit(False, str(e))
 
 
-class _DedupWorker(QThread):
+class _FrameSelectWorker(QThread):
     progress = Signal(float)
     finished = Signal(bool, str)
 
-    def __init__(self, frames_dir, project_dir, method, threshold):
+    def __init__(self, transcript_path, frames_dir, output_dir, provider_config):
         super().__init__()
+        self.transcript_path = transcript_path
         self.frames_dir = frames_dir
-        self.project_dir = project_dir
-        self.method = method
-        self.threshold = threshold
+        self.output_dir = output_dir
+        self.provider_config = provider_config
         self.result = None
 
     def run(self):
-        from src.visual import deduplicate
+        from src.frame_selector import select_frames
         try:
-            self.result = deduplicate(
-                self.frames_dir, self.project_dir,
-                method=self.method, threshold=self.threshold,
+            self.result = select_frames(
+                self.transcript_path, self.frames_dir, self.output_dir,
+                self.provider_config,
                 progress_cb=lambda v: self.progress.emit(v),
             )
             self.finished.emit(True, "")
@@ -701,15 +1284,22 @@ class _TranscribeWorker(QThread):
     progress = Signal(float)
     finished = Signal(bool, str)
 
-    def __init__(self, audio_path, project_dir, settings, model, language, vocabulary):
+    def __init__(self, audio_path, project_dir, asr_type, model, language,
+                 vocabulary, segment_length, asr_api_url, asr_api_key,
+                 asr_api_type="whisper", progress_cb=None):
         super().__init__()
         self.audio_path = audio_path
         self.project_dir = project_dir
-        self.settings = settings
+        self.asr_type = asr_type
         self.model = model
         self.language = language
         self.vocabulary = vocabulary
+        self.segment_length = segment_length
+        self.asr_api_url = asr_api_url
+        self.asr_api_key = asr_api_key
+        self.asr_api_type = asr_api_type
         self.result = None
+        self._progress_cb = progress_cb
 
     def run(self):
         from src.transcribe import transcribe
@@ -717,16 +1307,375 @@ class _TranscribeWorker(QThread):
             self.result = transcribe(
                 audio_path=self.audio_path,
                 output_dir=self.project_dir,
-                asr_type=self.settings.asr_type,
+                asr_type=self.asr_type,
                 model=self.model,
                 language=self.language,
                 vocabulary=self.vocabulary,
-                segment_length=self.settings.segment_length,
-                asr_api_url=self.settings.asr_api_url,
-                asr_api_key=self.settings.asr_api_key,
-                asr_cloud_model=self.settings.asr_cloud_model,
+                segment_length=self.segment_length,
+                asr_api_url=self.asr_api_url,
+                asr_api_key=self.asr_api_key,
+                asr_cloud_model=self.model,
+                asr_api_type=self.asr_api_type,
                 progress_cb=lambda v: self.progress.emit(v),
             )
             self.finished.emit(True, "")
         except Exception as e:
             self.finished.emit(False, str(e))
+
+
+class _VisionWorker(QThread):
+    progress = Signal(float)
+    token_update = Signal(dict)
+    finished = Signal(bool, str)
+
+    def __init__(self, key_frames_dir, output_dir, vision_config, prompts,
+                 transcript_segments=None):
+        super().__init__()
+        self.key_frames_dir = key_frames_dir
+        self.output_dir = output_dir
+        self.vision_config = vision_config
+        self.prompts = prompts
+        self.transcript_segments = transcript_segments or []
+        self._cancel_flag = {"cancel": False}
+        self.result = None
+
+    def cancel(self):
+        self._cancel_flag["cancel"] = True
+
+    def run(self):
+        from src.image_analysis import analyze_images
+        try:
+            result = analyze_images(
+                self.key_frames_dir, self.output_dir,
+                self.vision_config, self.prompts,
+                progress_cb=lambda v: self.progress.emit(v),
+                cancel_flag=self._cancel_flag,
+                token_cb=lambda d: self.token_update.emit(d),
+                transcript_segments=self.transcript_segments,
+            )
+            self.result = result
+            self.finished.emit(True, "")
+        except Exception as e:
+            self.finished.emit(False, str(e))
+
+
+class _GenerateWorker(QThread):
+    finished = Signal(str)   # notes_path
+    error = Signal(str)
+
+    def __init__(self, provider_config: dict, prompt: str,
+                 slides_path: str, transcript_path: str,
+                 project_dir: str, video_name: str):
+        super().__init__()
+        self.provider_config = provider_config
+        self.prompt = prompt
+        self.slides_path = slides_path
+        self.transcript_path = transcript_path
+        self.project_dir = project_dir
+        self.video_name = video_name
+
+    def run(self):
+        try:
+            import json, requests
+            from pathlib import Path
+
+            slides_text = ""
+            transcript_text = ""
+            if self.slides_path and os.path.exists(self.slides_path):
+                data = json.loads(Path(self.slides_path).read_text(encoding="utf-8"))
+                slides_text = json.dumps(data, ensure_ascii=False, indent=2)
+            if self.transcript_path and os.path.exists(self.transcript_path):
+                data = json.loads(Path(self.transcript_path).read_text(encoding="utf-8"))
+                transcript_text = json.dumps(data, ensure_ascii=False, indent=2)
+
+            if not slides_text and not transcript_text:
+                self.error.emit("没有可用的数据源")
+                return
+
+            base_url = self.provider_config.get("base_url", "").rstrip("/")
+            api_key = self.provider_config.get("api_key", "")
+            model = self.provider_config.get("model", "")
+
+            if not base_url or not api_key:
+                self.error.emit("请先在 Settings 中配置 Provider 的 URL 和 Key")
+                return
+
+            url = base_url + "/chat/completions"
+            user_content = f"--- 幻灯片描述 ---\n{slides_text}\n\n--- 语音转录 ---\n{transcript_text}"
+            payload = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": self.prompt},
+                    {"role": "user", "content": user_content},
+                ],
+                "max_tokens": 4096,
+            }
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            }
+            resp = requests.post(url, json=payload, headers=headers, timeout=180)
+            resp.raise_for_status()
+            notes_text = resp.json()["choices"][0]["message"]["content"].strip()
+
+            notes_dir = os.path.join(self.project_dir, "notes")
+            os.makedirs(notes_dir, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            notes_name = f"{self.video_name}_{ts}"
+            notes_path = os.path.join(notes_dir, f"{notes_name}.md")
+            Path(notes_path).write_text(notes_text, encoding="utf-8")
+
+            # 创建对话 session
+            from src.chat import create_session
+            create_session(
+                self.project_dir, self.video_name, notes_path, self.provider_config,
+            )
+            self.finished.emit(notes_path)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+class _BatchWorker(QThread):
+    progress = Signal(float)
+    video_progress = Signal(int, int)
+    log = Signal(str)
+    finished = Signal(bool, str)
+
+    def __init__(self, videos, output_dir, settings,
+                 asr_data, select_provider, vision_config, agg_provider):
+        super().__init__()
+        self.videos = videos
+        self.output_dir = output_dir
+        self.settings = settings
+        self.asr_data = asr_data
+        self.select_provider = select_provider
+        self.vision_config = vision_config
+        self.agg_provider = agg_provider
+        self._cancel = False
+
+    def _step_progress_cb(self, step_weights, video_idx, total_videos, step_idx):
+        """创建映射到整体进度的 progress_cb"""
+        base = video_idx / total_videos
+        weight = step_weights[step_idx] / total_videos
+        def cb(v):
+            self.progress.emit(min(base + weight * v, 1.0))
+        return cb
+
+    def run(self):
+        import json, requests, shutil
+        from src.media import extract_audio, extract_frames
+        from src.transcribe import transcribe
+        from src.frame_selector import select_frames
+        from src.image_analysis import analyze_images
+        from src.config import get_project_dir
+
+        s = self.settings
+        total = len(self.videos)
+        success = 0
+        failed = 0
+        step_weights = [0.05, 0.15, 0.05, 0.35, 0.40]  # Step 1-5 权重
+
+        for i, video_path in enumerate(self.videos):
+            if self._cancel:
+                break
+
+            name = Path(video_path).stem
+            self.log.emit(f"── [{i+1}/{total}] {name} ──")
+
+            try:
+                project_dir = str(get_project_dir(self.output_dir, video_path))
+
+                # Step 1: 媒体提取
+                self.log.emit(f"  Step 1 媒体提取...")
+                audio_dir = os.path.join(project_dir, "audio")
+                extract_audio(
+                    video_path, audio_dir,
+                    sample_rate=s.sample_rate,
+                    progress_cb=self._step_progress_cb(step_weights, i, total, 0),
+                )
+                fps = 1.0 / s.frame_interval if s.frame_interval > 0 else 1.0
+                extract_frames(
+                    video_path, project_dir,
+                    fps=fps, resolution_scale=s.resolution_scale,
+                    progress_cb=self._step_progress_cb(step_weights, i, total, 0),
+                )
+                self.log.emit(f"  Step 1 完成")
+
+                if self._cancel:
+                    break
+
+                # Step 2: 语音转录
+                self.log.emit(f"  Step 2 语音转录...")
+                mp3_files = list(Path(audio_dir).glob("*.mp3"))
+                if not mp3_files:
+                    raise RuntimeError("未生成音频文件")
+                audio_path = str(mp3_files[0])
+
+                language = s.whisper_language if s.whisper_language else None
+                vocabulary = s.vocabularies[0]["terms"] if s.vocabularies else None
+
+                asr_type = "cloud" if self.asr_data and self.asr_data.get("type") != "local" else "local"
+                if asr_type == "cloud":
+                    model = self.asr_data["model"]
+                    asr_api_url = self.asr_data.get("base_url", "")
+                    asr_api_key = self.asr_data.get("api_key", "")
+                    asr_api_type = self.asr_data.get("api_type", "whisper")
+                else:
+                    model = self.asr_data.get("model", s.whisper_model) if self.asr_data else s.whisper_model
+                    asr_api_url = ""
+                    asr_api_key = ""
+                    asr_api_type = "whisper"
+
+                transcribe(
+                    audio_path=audio_path,
+                    output_dir=project_dir,
+                    asr_type=asr_type,
+                    model=model,
+                    language=language,
+                    vocabulary=vocabulary,
+                    segment_length=s.segment_length,
+                    asr_api_url=asr_api_url,
+                    asr_api_key=asr_api_key,
+                    asr_cloud_model=model,
+                    asr_api_type=asr_api_type,
+                    progress_cb=self._step_progress_cb(step_weights, i, total, 1),
+                )
+                self.log.emit(f"  Step 2 完成")
+
+                if self._cancel:
+                    break
+
+                # Step 3: 智能选帧
+                self.log.emit(f"  Step 3 智能选帧...")
+                transcript_path = os.path.join(project_dir, "transcript", "transcript.json")
+                frames_dir = os.path.join(project_dir, "frames")
+                select_result = select_frames(
+                    transcript_path, frames_dir, project_dir,
+                    self.select_provider,
+                    progress_cb=self._step_progress_cb(step_weights, i, total, 2),
+                )
+                self.log.emit(f"  Step 3 选出 {select_result['selected']} 帧")
+
+                if self._cancel:
+                    break
+
+                # Step 4: 图片理解
+                self.log.emit(f"  Step 4 图片理解...")
+                key_frames_dir = os.path.join(project_dir, "key_frames")
+                vision_cfg = dict(self.vision_config) if self.vision_config else {}
+                if not vision_cfg.get("url"):
+                    vision_cfg["url"] = s.ollama_url
+
+                # 加载 transcript 作为上下文
+                transcript_segments = []
+                try:
+                    with open(transcript_path, "r", encoding="utf-8") as f:
+                        tdata = json.load(f)
+                    transcript_segments = tdata.get("segments", [])
+                except Exception:
+                    pass
+
+                prompts = {
+                    "ocr": s.vision_prompt_ocr,
+                    "diagram": s.vision_prompt_diagram,
+                    "title": s.vision_prompt_title,
+                    "single": s.vision_prompt_single,
+                }
+
+                analyze_images(
+                    key_frames_dir, project_dir, vision_cfg, prompts,
+                    progress_cb=self._step_progress_cb(step_weights, i, total, 3),
+                    transcript_segments=transcript_segments,
+                )
+                self.log.emit(f"  Step 4 完成")
+
+                if self._cancel:
+                    break
+
+                # Step 5: AI 聚合
+                self.log.emit(f"  Step 5 AI 聚合...")
+                slides_path = os.path.join(project_dir, "slides.json")
+
+                slides_text = ""
+                transcript_text = ""
+                if os.path.exists(slides_path):
+                    slides_text = Path(slides_path).read_text(encoding="utf-8")
+                if os.path.exists(transcript_path):
+                    transcript_text = Path(transcript_path).read_text(encoding="utf-8")
+
+                prompt = s.default_distill_prompt
+                base_url = self.agg_provider.get("base_url", "").rstrip("/")
+                api_key = self.agg_provider.get("api_key", "")
+                agg_model = self.agg_provider.get("model", "")
+
+                url = base_url + "/chat/completions"
+                user_content = f"--- 幻灯片描述 ---\n{slides_text}\n\n--- 语音转录 ---\n{transcript_text}"
+                payload = {
+                    "model": agg_model,
+                    "messages": [
+                        {"role": "system", "content": prompt},
+                        {"role": "user", "content": user_content},
+                    ],
+                    "max_tokens": 4096,
+                }
+                headers = {
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {api_key}",
+                }
+                resp = requests.post(url, json=payload, headers=headers, timeout=300)
+                resp.raise_for_status()
+                notes_text = resp.json()["choices"][0]["message"]["content"].strip()
+
+                notes_dir = os.path.join(project_dir, "notes")
+                os.makedirs(notes_dir, exist_ok=True)
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                notes_path = os.path.join(notes_dir, f"{name}_{ts}.md")
+                Path(notes_path).write_text(notes_text, encoding="utf-8")
+
+                from src.chat import create_session
+                create_session(project_dir, name, notes_path, self.agg_provider)
+
+                self.log.emit(f"  ✓ {name} 笔记已生成\n")
+                success += 1
+
+            except Exception as e:
+                self.log.emit(f"  ✗ {name} 失败: {e}\n")
+                failed += 1
+
+            self.video_progress.emit(i + 1, total)
+
+        msg = f"完成 {success}/{total}"
+        if failed:
+            msg += f"，失败 {failed}"
+        if self._cancel:
+            msg = f"已停止 — {msg}"
+        self.finished.emit(not self._cancel, msg)
+
+
+class _DropListWidget(QListWidget):
+    """支持文件拖拽的 QListWidget"""
+    VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm"}
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+
+    def dragEnterEvent(self, event: QDragEnterEvent):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event: QDropEvent):
+        for url in event.mimeData().urls():
+            path = url.toLocalFile()
+            if path and Path(path).suffix.lower() in self.VIDEO_EXTS:
+                self.addItem(path)
+        event.acceptProposedAction()

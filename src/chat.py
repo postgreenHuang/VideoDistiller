@@ -1,0 +1,299 @@
+"""
+Video-Distiller AI 对话模块
+- 每个对话是独立 session（按时间戳命名）
+- session 持久化到 ~/.Video-Distiller/sessions/{session_id}/
+- 关联 slides.json / transcript.json / notes.md
+"""
+
+import json
+import os
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+_SESSIONS_DIR = Path.home() / ".Video-Distiller" / "sessions"
+
+
+CHAT_SYSTEM_PROMPT = (
+    "你是一位技术学习导师。你刚刚和学生一起学习了一段技术教程。\n"
+    "以下是教程的完整学习笔记和原始幻灯片描述，作为你的知识基础：\n\n"
+    "--- 学习笔记 ---\n{notes}\n\n"
+    "--- 幻灯片描述 ---\n{slides}\n\n"
+    "你的任务是：\n"
+    "1. 回答学生关于教程内容的问题\n"
+    "2. 用通俗的语言解释复杂概念\n"
+    "3. 帮助学生建立知识之间的联系\n"
+    "4. 指出容易忽略的重要细节\n"
+    "5. 建议进一步学习的方向"
+)
+
+
+class ChatSession:
+    """管理单个对话 session"""
+
+    def __init__(self, session_dir: str, provider_config: dict):
+        self.session_dir = session_dir
+        self.history_path = os.path.join(session_dir, "chat_history.json")
+        self.provider = provider_config
+        self.base_url = provider_config.get("base_url", "").rstrip("/")
+        self.api_key = provider_config.get("api_key", "")
+        self.model = provider_config.get("model", "")
+        self.system_prompt = ""
+        self.messages: list[dict] = []
+        # 元数据
+        self.name = ""
+        self.created_at = ""
+        self.slides_path = ""
+        self.transcript_path = ""
+        self.notes_path = ""
+
+    def initialize(self, notes_path: str = "", slides_path: str = "",
+                   transcript_path: str = "") -> bool:
+        """加蒸馏结果构建 system prompt，返回是否成功"""
+        notes = self._read_file(notes_path)
+        slides = self._summarize_slides(slides_path)
+
+        if not notes and not slides:
+            return False
+
+        self.notes_path = notes_path
+        self.slides_path = slides_path
+        self.transcript_path = transcript_path
+        self.system_prompt = CHAT_SYSTEM_PROMPT.format(
+            notes=notes or "(未找到蒸馏笔记)",
+            slides=slides or "(未找到幻灯片描述)",
+        )
+        self._load_history()
+        return True
+
+    def update_files(self, notes_path: str = "", slides_path: str = "",
+                     transcript_path: str = ""):
+        """更新关联文件并重建 system prompt"""
+        self.notes_path = notes_path
+        self.slides_path = slides_path
+        self.transcript_path = transcript_path
+
+        notes = self._read_file(notes_path)
+        slides = self._summarize_slides(slides_path)
+
+        if notes or slides:
+            self.system_prompt = CHAT_SYSTEM_PROMPT.format(
+                notes=notes or "(未找到蒸馏笔记)",
+                slides=slides or "(未找到幻灯片描述)",
+            )
+
+        # 如果有笔记且还没有首条消息，注入笔记作为第一条
+        if notes and not self.messages:
+            self.messages.append({
+                "role": "assistant",
+                "content": notes,
+            })
+
+        # 更新名称
+        if notes_path:
+            stem = Path(notes_path).stem
+            self.name = stem
+
+        self._save_history()
+
+    def chat(self, user_message: str) -> str:
+        if not self.system_prompt:
+            return "请先配置学习资料（点击齿轮按钮），然后再开始对话。"
+
+        self.messages.append({"role": "user", "content": user_message})
+        api_messages = [{"role": "system", "content": self.system_prompt}]
+        api_messages.extend(self.messages[-40:])
+
+        reply = self._call_provider(api_messages)
+        self.messages.append({"role": "assistant", "content": reply})
+        self._save_history()
+        return reply
+
+    def clear_history(self):
+        self.messages.clear()
+        self._save_history()
+
+    # ─── Provider ───
+
+    def _call_provider(self, messages: list[dict]) -> str:
+        import requests
+
+        if not self.base_url or not self.api_key:
+            raise ValueError("请先在 Settings 中配置 AI Provider 的 URL 和 API Key")
+
+        url = self.base_url + "/chat/completions"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+        }
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": 2048,
+        }
+        resp = requests.post(url, json=payload, headers=headers, timeout=120)
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"].strip()
+
+    # ─── 持久化 ───
+
+    def _save_history(self):
+        os.makedirs(self.session_dir, exist_ok=True)
+        data = {
+            "name": self.name,
+            "created_at": self.created_at,
+            "slides_path": self.slides_path,
+            "transcript_path": self.transcript_path,
+            "notes_path": self.notes_path,
+            "model": self.model,
+            "system_prompt": self.system_prompt,
+            "messages": self.messages,
+        }
+        with open(self.history_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+    def _load_history(self):
+        if os.path.exists(self.history_path):
+            try:
+                data = json.loads(Path(self.history_path).read_text(encoding="utf-8"))
+                self.messages = data.get("messages", [])
+                self.name = data.get("name", self.name)
+                self.created_at = data.get("created_at", "")
+                self.slides_path = data.get("slides_path", "")
+                self.transcript_path = data.get("transcript_path", "")
+                self.notes_path = data.get("notes_path", "")
+                if data.get("system_prompt"):
+                    self.system_prompt = data["system_prompt"]
+            except Exception:
+                self.messages = []
+
+    # ─── 工具 ───
+
+    @staticmethod
+    def _read_file(path: str) -> str:
+        if path and os.path.exists(path):
+            try:
+                return Path(path).read_text(encoding="utf-8").strip()
+            except Exception:
+                pass
+        return ""
+
+    @staticmethod
+    def _summarize_slides(path: str) -> str:
+        if not path or not os.path.exists(path):
+            return ""
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+            slides = data.get("slides", [])
+            lines = []
+            for s in slides:
+                ts = s.get("timestamp", "")
+                title = s.get("title", "")
+                text = s.get("text", "")[:200]
+                diagrams = s.get("diagrams", "")
+                line = f"[{ts}] {title}"
+                if text:
+                    line += f" — {text}"
+                if diagrams and diagrams != "无":
+                    line += f" | 图表: {diagrams[:100]}"
+                lines.append(line)
+            return "\n".join(lines)
+        except Exception:
+            return ""
+
+
+# ─── Session 管理 ───
+
+def create_session(project_dir: str, video_name: str = "",
+                   notes_path: str = "", provider_config: Optional[dict] = None) -> ChatSession:
+    """创建新的对话 session，返回 ChatSession"""
+    now = datetime.now()
+    ts = now.strftime("%Y%m%d_%H%M%S")
+    display = now.strftime("%m-%d %H:%M")
+
+    sessions_dir = str(_SESSIONS_DIR)
+    session_dir = os.path.join(sessions_dir, ts)
+    os.makedirs(session_dir, exist_ok=True)
+
+    cfg = provider_config or {}
+    session = ChatSession(session_dir, cfg)
+    session.created_at = now.strftime("%Y-%m-%d %H:%M:%S")
+
+    # 自动查找关联文件
+    if not notes_path:
+        notes_dir = os.path.join(project_dir, "notes")
+        if os.path.isdir(notes_dir):
+            for f in sorted(os.listdir(notes_dir), reverse=True):
+                if f.endswith(".md"):
+                    notes_path = os.path.join(notes_dir, f)
+                    break
+
+    slides_path = os.path.join(project_dir, "slides.json")
+    if not os.path.exists(slides_path):
+        slides_path = ""
+    transcript_path = os.path.join(project_dir, "transcript", "transcript.json")
+    if not os.path.exists(transcript_path):
+        transcript_path = ""
+
+    session.initialize(notes_path, slides_path, transcript_path)
+
+    # 名称：有笔记用笔记名，有视频名用视频名，否则用时间
+    if session.notes_path:
+        session.name = Path(session.notes_path).stem
+    elif video_name:
+        session.name = f"{video_name} {display}"
+    else:
+        session.name = display
+
+    session._save_history()
+    return session
+
+
+def create_empty_session(output_dir: str, provider_config: Optional[dict] = None) -> ChatSession:
+    """创建空白对话 session，不自动查找文件"""
+    now = datetime.now()
+    ts = now.strftime("%Y%m%d_%H%M%S")
+    display = now.strftime("%m-%d %H:%M")
+
+    sessions_dir = str(_SESSIONS_DIR)
+    session_dir = os.path.join(sessions_dir, ts)
+    os.makedirs(session_dir, exist_ok=True)
+
+    cfg = provider_config or {}
+    session = ChatSession(session_dir, cfg)
+    session.name = display
+    session.created_at = now.strftime("%Y-%m-%d %H:%M:%S")
+    session._save_history()
+    return session
+
+
+def list_sessions() -> list[dict]:
+    """扫描 ~/.Video-Distiller/sessions/ 下所有 session"""
+    results = []
+    if not _SESSIONS_DIR.is_dir():
+        return results
+
+    for sid in sorted(os.listdir(_SESSIONS_DIR), reverse=True):
+        sdir = str(_SESSIONS_DIR / sid)
+        hfile = os.path.join(sdir, "chat_history.json")
+        if not os.path.isfile(hfile):
+            continue
+        try:
+            data = json.loads(Path(hfile).read_text(encoding="utf-8"))
+        except Exception:
+            continue
+
+        msgs = data.get("messages", [])
+        rounds = sum(1 for m in msgs if m.get("role") == "user")
+        name = data.get("name", sid)
+        results.append({
+            "name": name,
+            "session_id": sid,
+            "session_dir": sdir,
+            "rounds": rounds,
+            "created_at": data.get("created_at", ""),
+            "slides_path": data.get("slides_path", ""),
+            "transcript_path": data.get("transcript_path", ""),
+            "notes_path": data.get("notes_path", ""),
+        })
+    return results

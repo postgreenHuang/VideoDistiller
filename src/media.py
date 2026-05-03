@@ -49,7 +49,8 @@ def _run_ffmpeg(
     progress_cb: Optional[Callable[[float], None]] = None,
 ):
     proc = subprocess.Popen(
-        cmd, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, text=True,
+        cmd, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL,
+        text=True, encoding="utf-8", errors="replace",
         creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
     )
     duration = 0.0
@@ -89,6 +90,7 @@ def extract_audio(
 # ─── ② 帧提取 ───
 
 RESOLUTION_FILTERS = {
+    "3/4": "scale=iw*0.75:ih*0.75",
     "1/2": "scale=iw*0.5:ih*0.5",
     "1/4": "scale=iw*0.25:ih*0.25",
     "1/6": "scale=iw/6:ih/6",

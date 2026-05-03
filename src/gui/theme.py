@@ -214,11 +214,29 @@ def build_stylesheet(theme_name: str) -> str:
         selection-color: #ffffff;
         padding: 2px;
         outline: none;
+        color: {c['text']};
+    }}
+    QComboBox QAbstractItemView::item {{
+        background: {c['surface']};
+        color: {c['text']};
+        padding: 4px 8px;
+        min-height: 22px;
+    }}
+    QComboBox QAbstractItemView::item:selected {{
+        background: {c['accent']};
+        color: #ffffff;
+    }}
+    QComboBox QAbstractItemView::item:hover:!selected {{
+        background: {c['btn_secondary']};
     }}
     QComboBox QLineEdit {{
         background: {c['input_bg']};
         color: {c['text']};
         border: none;
+    }}
+    QComboBox QFrame {{
+        background: {c['surface']};
+        border: 1px solid {c['border']};
     }}
 
     /* ─── Buttons ─── */
@@ -247,6 +265,7 @@ def build_stylesheet(theme_name: str) -> str:
     QPushButton[class="secondary"] {{
         background: {c['btn_secondary']};
         color: {c['btn_secondary_text']};
+        padding: 2px 6px;
     }}
     QPushButton[class="secondary"]:hover {{
         background: {c['btn_secondary_hover']};
@@ -368,5 +387,160 @@ def build_stylesheet(theme_name: str) -> str:
     QToolButton:hover {{
         background: {c['btn_secondary']};
         color: {c['text']};
+    }}
+
+    /* ─── Menu (右键菜单) ─── */
+    QMenu {{
+        background: {c['surface']};
+        border: 1px solid {c['border']};
+        border-radius: 6px;
+        padding: 4px;
+        color: {c['text']};
+    }}
+    QMenu::item {{
+        padding: 6px 24px;
+        border-radius: 4px;
+    }}
+    QMenu::item:selected {{
+        background: {c['accent']};
+        color: #ffffff;
+    }}
+    QMenu::separator {{
+        height: 1px;
+        background: {c['border_group']};
+        margin: 4px 8px;
+    }}
+
+    /* ─── Chat 整体容器 ─── */
+    QWidget[class="chat-right"] {{
+        background: {c['bg']};
+        border: none;
+    }}
+
+    /* ─── 关键帧画廊缩略图 ─── */
+    QLabel[class="gallery-thumb"] {{
+        background: {c['surface']};
+        border: 2px solid {c['border_group']};
+        border-radius: 4px;
+    }}
+    QLabel[class="gallery-thumb"]:hover {{
+        border: 2px solid {c['accent']};
+    }}
+
+    QWidget[class="chat-input-bar"] {{
+        background: {c['bg']};
+        border: none;
+    }}
+    QWidget[class="chat-messages"] {{
+        background: {c['bg']};
+        border: none;
+    }}
+
+    /* ─── Chat 分隔线 ─── */
+    QFrame[class="chat-sep"] {{
+        background: {c['border_group']};
+        border: none;
+        margin: 0;
+        padding: 0;
+    }}
+
+    /* ─── Chat 状态栏 ─── */
+    QLabel[class="chat-status"] {{
+        background: {c['bg']};
+        color: {c['text_secondary']};
+        font-size: 12px;
+        border: none;
+    }}
+
+    /* ─── Chat 侧边栏 ─── */
+    QWidget[class="chat-sidebar"] {{
+        background: {c['surface']};
+        border: none;
+        border-right: 1px solid {c['border_group']};
+    }}
+    QWidget[class="chat-sidebar-top"] {{
+        background: transparent;
+        border: none;
+    }}
+    QLabel[class="sidebar-title"] {{
+        background: transparent;
+        color: {c['text_secondary']};
+        font-size: 11px;
+        font-weight: 600;
+        letter-spacing: 0.5px;
+        border: none;
+    }}
+    QListWidget[class="project-list"] {{
+        background: {c['surface']};
+        border: none;
+        outline: none;
+        padding: 4px 8px;
+    }}
+    QListWidget[class="project-list"]::item {{
+        padding: 10px 12px;
+        border-radius: 6px;
+        color: {c['text']};
+        font-size: 13px;
+        border: none;
+    }}
+    QListWidget[class="project-list"]::item:selected {{
+        background: {c['accent']};
+        color: #ffffff;
+    }}
+    QListWidget[class="project-list"]::item:hover:!selected {{
+        background: {c['btn_secondary']};
+    }}
+
+    /* ─── Chat 模型选择 ─── */
+    QComboBox[class="chat-model-combo"] {{
+        background: {c['input_bg']};
+        border: 1px solid {c['border']};
+        border-radius: 4px;
+        padding: 3px 6px;
+        font-size: 12px;
+        color: {c['text']};
+        min-height: 20px;
+    }}
+    QComboBox[class="chat-model-combo"]::drop-down {{
+        border: none;
+        width: 18px;
+    }}
+    QComboBox[class="chat-model-combo"] QAbstractItemView {{
+        background: {c['surface']};
+        border: 1px solid {c['border']};
+        border-radius: 4px;
+        selection-background-color: {c['accent']};
+        selection-color: #ffffff;
+        color: {c['text']};
+        outline: none;
+        padding: 2px;
+    }}
+
+    /* ─── Chat 消息气泡 ─── */
+    QLabel[class="msg-user"] {{
+        background: {c['accent']};
+        color: #ffffff;
+        border: none;
+        border-radius: 14px;
+        padding: 10px 16px;
+        margin-left: 48px;
+    }}
+    QLabel[class="msg-assistant"] {{
+        background: {c['surface']};
+        color: {c['text']};
+        border: none;
+        border-radius: 14px;
+        padding: 10px 16px;
+        margin-right: 48px;
+    }}
+
+    /* ─── Chat 消息滚动区 ─── */
+    QScrollArea[class="chat-scroll"] {{
+        background: {c['bg']};
+        border: none;
+    }}
+    QScrollArea[class="chat-scroll"] > QWidget > QWidget {{
+        background: {c['bg']};
+        border: none;
     }}
     """
