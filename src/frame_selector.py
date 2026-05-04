@@ -291,6 +291,21 @@ def select_frames(
     # 按时间排序
     unique_matched.sort(key=lambda x: x["matched_seconds"])
 
+    # 0 帧回退：每 2 分钟保留 1 帧，确保至少有视觉素材
+    if not unique_matched and available:
+        interval = 120  # 2 分钟
+        fallback_ts = 0.0
+        while fallback_ts <= available[-1][1]:
+            fn = _find_nearest_frame(fallback_ts, available)
+            if fn:
+                unique_matched.append({
+                    "timestamp": _seconds_to_mmss(fallback_ts),
+                    "reason": "回退采样（AI 未选出关键帧）",
+                    "file": fn,
+                    "matched_seconds": fallback_ts,
+                })
+            fallback_ts += interval
+
     if progress_cb:
         progress_cb(0.9)
 

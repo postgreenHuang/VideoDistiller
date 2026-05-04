@@ -119,6 +119,31 @@ class SettingsDialog(QDialog):
 
         layout.addWidget(g)
 
+        # 对话字体
+        fg = QGroupBox("对话字体")
+        fgl = QGridLayout(fg)
+        fgl.setSpacing(6)
+
+        fgl.addWidget(QLabel("字体:"), 0, 0)
+        self.font_family_combo = QComboBox()
+        from PySide6.QtGui import QFontDatabase
+        db = QFontDatabase()
+        families = db.families()
+        self.font_family_combo.addItem("默认")
+        self.font_family_combo.addItems(families)
+        self.font_family_combo.setEditable(True)
+        fgl.addWidget(self.font_family_combo, 0, 1)
+
+        fgl.addWidget(QLabel("缩放 (%):"), 1, 0)
+        self.font_scale_spin = QSpinBox()
+        self.font_scale_spin.setRange(50, 200)
+        self.font_scale_spin.setSingleStep(10)
+        self.font_scale_spin.setValue(100)
+        self.font_scale_spin.setSuffix("%")
+        fgl.addWidget(self.font_scale_spin, 1, 1)
+
+        layout.addWidget(fg)
+
         # Ollama 地址
         og = QGroupBox("Ollama 服务")
         ogl = QGridLayout(og)
@@ -715,6 +740,15 @@ class SettingsDialog(QDialog):
         self.segment_spin.setValue(s.segment_length)
         self.ollama_url_edit.setText(s.ollama_url)
 
+        # 对话字体
+        if s.chat_font_family:
+            idx = self.font_family_combo.findText(s.chat_font_family)
+            if idx >= 0:
+                self.font_family_combo.setCurrentIndex(idx)
+            else:
+                self.font_family_combo.setCurrentText(s.chat_font_family)
+        self.font_scale_spin.setValue(s.chat_font_scale)
+
         # 图片识别
         self._vision_data = [dict(v) for v in s.vision_models]
         self._rebuild_vision_cards()
@@ -757,6 +791,11 @@ class SettingsDialog(QDialog):
         s.ssim_threshold = self.ssim_spin.value()
         s.segment_length = self.segment_spin.value()
         s.ollama_url = self.ollama_url_edit.text()
+
+        # 对话字体
+        font_text = self.font_family_combo.currentText()
+        s.chat_font_family = "" if font_text == "默认" else font_text
+        s.chat_font_scale = self.font_scale_spin.value()
 
         # 图片识别
         s.vision_models = [{k: v for k, v in d.items() if k != "_widgets"} for d in self._vision_data]

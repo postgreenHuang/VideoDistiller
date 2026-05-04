@@ -167,6 +167,15 @@ class ChatSession:
             except Exception:
                 self.messages = []
 
+        # 有笔记但消息为空时，注入笔记作为首条助手消息
+        if self.notes_path and not self.messages:
+            notes = self._read_file(self.notes_path)
+            if notes:
+                self.messages.append({
+                    "role": "assistant",
+                    "content": notes,
+                })
+
     # ─── 工具 ───
 
     @staticmethod

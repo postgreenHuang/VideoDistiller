@@ -6,15 +6,18 @@ Video-Distiller AI 对话界面
 
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import Qt, QThread, Signal, QTimer
+from PySide6.QtGui import QFont, QFontDatabase
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QTextEdit, QScrollArea, QSizePolicy, QListWidget,
     QListWidgetItem, QFrame, QComboBox, QFileDialog, QMenu,
     QDialog, QGridLayout, QLineEdit, QDialogButtonBox,
+    QSplitter,
 )
 
 from src.chat import ChatSession, create_empty_session, list_sessions
@@ -24,14 +27,65 @@ _THINKING_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇
 
 
 class MessageBubble(QLabel):
+    _font_family = ""
+    _font_scale = 100
+
     def __init__(self, role: str, text: str):
         super().__init__()
         self.setProperty("class", f"msg-{role}")
         self.setWordWrap(True)
-        self.setText(text)
-        self.setTextFormat(Qt.TextFormat.MarkdownText)
+        self._raw_text = text
+        self.setText(self._render_md(text, self._font_family, self._font_scale))
+        self.setTextFormat(Qt.TextFormat.RichText)
         self.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
         self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+        self._sync_widget_font()
+
+    @staticmethod
+    def _render_md(text: str, font_family: str, font_scale: int) -> str:
+        import re
+        from PySide6.QtGui import QTextDocument, QFont
+
+        doc = QTextDocument()
+
+        base_px = 14.0 * font_scale / 100.0
+        family = font_family if font_family else ("PingFang SC" if sys.platform == "darwin" else "Microsoft YaHei UI")
+        font = QFont(family)
+        font.setPixelSize(int(base_px))
+        doc.setDefaultFont(font)
+
+        doc.setMarkdown(text)
+        html = doc.toHtml()
+
+        def _patch(tag, top, bottom):
+            nonlocal html
+            html = re.sub(
+                rf'(<{tag}\s[^>]*?)margin-top:\s*\d+px;(\s*)margin-bottom:\s*\d+px',
+                rf'\g<1>margin-top:{top}px;\2margin-bottom:{bottom}px',
+                html,
+            )
+
+        _patch('h1', 20, 8)
+        _patch('h2', 18, 6)
+        _patch('h3', 14, 4)
+        _patch('p',  4,  4)
+        _patch('li', 2,  2)
+        return html
+
+    def _apply_font(self):
+        self.setText(self._render_md(self._raw_text, self._font_family, self._font_scale))
+        self._sync_widget_font()
+
+    def _sync_widget_font(self):
+        """确保 QLabel 基线字体与渲染时一致，使 HTML 相对字号正确解析"""
+        base_px = 14.0 * self._font_scale / 100.0
+        family = f'"{self._font_family}"' if self._font_family else "inherit"
+        self.setStyleSheet(f"font-family: {family}; font-size: {base_px}px;")
+
+    @classmethod
+    def set_chat_font(cls, family: str, scale: int):
+        cls._font_family = family
+        cls._font_scale = scale
 
 
 class _ChatWorker(QThread):
@@ -146,14 +200,10 @@ class ChatWidget(QWidget):
         self._build_ui()
 
     def _build_ui(self):
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
-
         # ─── 左侧：session 列表 ───
         left_panel = QWidget()
         left_panel.setProperty("class", "chat-sidebar")
-        left_panel.setFixedWidth(220)
+        left_panel.setMinimumWidth(140)
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(0)
@@ -206,7 +256,7 @@ class ChatWidget(QWidget):
         self.status_label = QLabel("选择或新建一个对话")
         self.status_label.setProperty("class", "chat-status")
         self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.status_label.setFixedHeight(28)
+        self.status_label.setFixedHeight(32)
         status_row.addWidget(self.status_label, 1)
 
         self.btn_config = QPushButton("⚙")
@@ -222,7 +272,7 @@ class ChatWidget(QWidget):
         self.files_label = QLabel("")
         self.files_label.setProperty("class", "hint")
         self.files_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.files_label.setFixedHeight(20)
+        self.files_label.setFixedHeight(22)
         right_layout.addWidget(self.files_label)
 
         sep2 = QFrame()
@@ -240,8 +290,8 @@ class ChatWidget(QWidget):
         self.messages_widget.setProperty("class", "chat-messages")
         self.messages_layout = QVBoxLayout(self.messages_widget)
         self.messages_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
-        self.messages_layout.setSpacing(10)
-        self.messages_layout.setContentsMargins(16, 16, 16, 16)
+        self.messages_layout.setSpacing(16)
+        self.messages_layout.setContentsMargins(20, 16, 20, 16)
         self.messages_layout.addStretch()
 
         self.scroll.setWidget(self.messages_widget)
@@ -258,11 +308,11 @@ class ChatWidget(QWidget):
         input_bar.setProperty("class", "chat-input-bar")
         input_layout = QVBoxLayout(input_bar)
         input_layout.setContentsMargins(16, 10, 16, 10)
-        input_layout.setSpacing(6)
+        input_layout.setSpacing(8)
 
         self.input_edit = QTextEdit()
         self.input_edit.setPlaceholderText("输入你的问题...")
-        self.input_edit.setFixedHeight(64)
+        self.input_edit.setFixedHeight(72)
         self.input_edit.setMaximumHeight(100)
         input_layout.addWidget(self.input_edit)
 
@@ -288,14 +338,32 @@ class ChatWidget(QWidget):
         input_layout.addLayout(bottom_row)
         right_layout.addWidget(input_bar)
 
-        layout.addWidget(left_panel)
-        layout.addWidget(right_panel, 1)
+        # 用 Splitter 支持拖拽调整侧边栏宽度
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setHandleWidth(3)
+        splitter.setChildrenCollapsible(False)
+        splitter.addWidget(left_panel)
+        splitter.addWidget(right_panel)
+        splitter.setSizes([220, 600])
+        splitter.setStretchFactor(1, 1)
+
+        main_layout = QHBoxLayout(self)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.addWidget(splitter)
 
     # ─── 模型切换 ───
 
     def set_providers(self, providers: list):
         self._all_providers = [dict(p) for p in providers if p.get("api_key")]
         self._refresh_model_combo()
+
+    def apply_font_settings(self, family: str, scale: int):
+        MessageBubble.set_chat_font(family, scale)
+        # 刷新已有气泡的字体
+        for i in range(self.messages_layout.count()):
+            item = self.messages_layout.itemAt(i)
+            if item and item.widget() and isinstance(item.widget(), MessageBubble):
+                item.widget()._apply_font()
 
     def _refresh_model_combo(self):
         self.model_combo.blockSignals(True)
@@ -602,7 +670,10 @@ class ChatWidget(QWidget):
 
     def _scroll_to_bottom(self):
         sb = self.scroll.verticalScrollBar()
-        sb.setValue(sb.maximum())
+        # 只在用户接近底部时自动滚动，避免抢夺滚动控制权
+        at_bottom = sb.value() >= sb.maximum() - 60
+        if at_bottom:
+            sb.setValue(sb.maximum())
 
     def _clear_messages(self):
         while self.messages_layout.count() > 1:

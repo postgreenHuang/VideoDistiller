@@ -2,22 +2,34 @@
 Video-Distiller 主题管理
 """
 
+import sys
+
+_FONT_FAMILY = (
+    '"PingFang SC", "SF Pro Display", "Helvetica Neue", sans-serif'
+    if sys.platform == "darwin" else
+    '"Microsoft YaHei UI", "Segoe UI", "PingFang SC", sans-serif'
+)
+
+_CHAT_FONT_DEFAULT = (
+    "PingFang SC" if sys.platform == "darwin" else "Microsoft YaHei UI"
+)
+
 THEMES = {
     "light": {
-        "bg": "#f5f5f7",
-        "surface": "#ffffff",
-        "text": "#1d1d1f",
+        "bg": "#f2f2f5",
+        "surface": "#fafafa",
+        "text": "#2c2c2e",
         "text_secondary": "#86868b",
         "text_label": "#48484a",
-        "accent": "#007aff",
-        "accent_hover": "#0066d6",
-        "accent_pressed": "#0055b3",
+        "accent": "#5b86c4",
+        "accent_hover": "#4a75b3",
+        "accent_pressed": "#3a65a3",
         "border": "#d2d2d7",
         "border_group": "#e5e5ea",
-        "input_bg": "#f5f5f7",
+        "input_bg": "#f2f2f5",
         "input_focus_bg": "#ffffff",
         "btn_secondary": "#e5e5ea",
-        "btn_secondary_text": "#1d1d1f",
+        "btn_secondary_text": "#2c2c2e",
         "btn_secondary_hover": "#d2d2d7",
         "progress_bg": "#e5e5ea",
         "scrollbar": "#c7c7cc",
@@ -27,9 +39,9 @@ THEMES = {
     "dark": {
         "bg": "#1c1c1e",
         "surface": "#2c2c2e",
-        "text": "#f5f5f7",
-        "text_secondary": "#98989d",
-        "text_label": "#a1a1a6",
+        "text": "#dcdce2",
+        "text_secondary": "#8e8e93",
+        "text_label": "#92929a",
         "accent": "#0a84ff",
         "accent_hover": "#409cff",
         "accent_pressed": "#0066d6",
@@ -38,7 +50,7 @@ THEMES = {
         "input_bg": "#2c2c2e",
         "input_focus_bg": "#3a3a3c",
         "btn_secondary": "#3a3a3c",
-        "btn_secondary_text": "#f5f5f7",
+        "btn_secondary_text": "#dcdce2",
         "btn_secondary_hover": "#48484a",
         "progress_bg": "#3a3a3c",
         "scrollbar": "#48484a",
@@ -56,7 +68,7 @@ def build_stylesheet(theme_name: str) -> str:
     }}
 
     QWidget {{
-        font-family: "Segoe UI", "SF Pro Display", "Helvetica Neue", sans-serif;
+        font-family: {_FONT_FAMILY};
         font-size: 13px;
         color: {c['text']};
     }}
@@ -326,11 +338,11 @@ def build_stylesheet(theme_name: str) -> str:
     }}
     QLabel[class="hint"] {{
         color: {c['text_secondary']};
-        font-size: 12px;
+        font-size: 13px;
     }}
     QLabel[class="status"] {{
         color: {c['text_secondary']};
-        font-size: 12px;
+        font-size: 13px;
         padding: 2px 0;
     }}
 
@@ -340,6 +352,14 @@ def build_stylesheet(theme_name: str) -> str:
         border: none;
     }}
     QScrollArea > QWidget > QWidget {{
+
+    /* ─── Splitter 拖拽手柄 ─── */
+    QSplitter::handle {{
+        background: {c['border_group']};
+    }}
+    QSplitter::handle:hover {{
+        background: {c['accent']};
+    }}
         background: transparent;
     }}
 
@@ -371,7 +391,7 @@ def build_stylesheet(theme_name: str) -> str:
         background: {c['bg']};
         color: {c['text_secondary']};
         border-top: 1px solid {c['border_group']};
-        font-size: 12px;
+        font-size: 13px;
         padding: 3px 10px;
     }}
 
@@ -382,7 +402,7 @@ def build_stylesheet(theme_name: str) -> str:
         border-radius: 4px;
         padding: 4px 8px;
         color: {c['text_secondary']};
-        font-size: 12px;
+        font-size: 13px;
     }}
     QToolButton:hover {{
         background: {c['btn_secondary']};
@@ -442,21 +462,22 @@ def build_stylesheet(theme_name: str) -> str:
         border: none;
         margin: 0;
         padding: 0;
+        max-height: 1px;
     }}
 
     /* ─── Chat 状态栏 ─── */
     QLabel[class="chat-status"] {{
         background: {c['bg']};
         color: {c['text_secondary']};
-        font-size: 12px;
+        font-size: 13px;
         border: none;
+        padding: 4px 12px;
     }}
 
     /* ─── Chat 侧边栏 ─── */
     QWidget[class="chat-sidebar"] {{
         background: {c['surface']};
         border: none;
-        border-right: 1px solid {c['border_group']};
     }}
     QWidget[class="chat-sidebar-top"] {{
         background: transparent;
@@ -465,7 +486,7 @@ def build_stylesheet(theme_name: str) -> str:
     QLabel[class="sidebar-title"] {{
         background: transparent;
         color: {c['text_secondary']};
-        font-size: 11px;
+        font-size: 13px;
         font-weight: 600;
         letter-spacing: 0.5px;
         border: none;
@@ -497,7 +518,7 @@ def build_stylesheet(theme_name: str) -> str:
         border: 1px solid {c['border']};
         border-radius: 4px;
         padding: 3px 6px;
-        font-size: 12px;
+        font-size: 13px;
         color: {c['text']};
         min-height: 20px;
     }}
@@ -519,19 +540,19 @@ def build_stylesheet(theme_name: str) -> str:
     /* ─── Chat 消息气泡 ─── */
     QLabel[class="msg-user"] {{
         background: {c['accent']};
-        color: #ffffff;
+        color: #e8e8ee;
         border: none;
-        border-radius: 14px;
-        padding: 10px 16px;
-        margin-left: 48px;
+        border-radius: 10px;
+        padding: 12px 18px;
+        margin-left: 36px;
     }}
     QLabel[class="msg-assistant"] {{
         background: {c['surface']};
         color: {c['text']};
         border: none;
-        border-radius: 14px;
-        padding: 10px 16px;
-        margin-right: 48px;
+        border-radius: 10px;
+        padding: 12px 18px;
+        margin-right: 36px;
     }}
 
     /* ─── Chat 消息滚动区 ─── */

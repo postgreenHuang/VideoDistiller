@@ -68,6 +68,15 @@ class VocabConfig:
 class Settings:
     last_video_path: str = ""
     last_output_dir: str = ""
+    last_asr_model: str = ""       # 蒸馏 Step 2 转录模型
+    last_select_provider: str = "" # 蒸馏 Step 3 选帧 AI
+    last_agg_provider: str = ""    # 蒸馏 Step 5 聚合 AI
+    last_batch_asr: str = ""       # 批量 转录模型
+    last_batch_select: str = ""    # 批量 选帧 AI
+    last_batch_vision: str = ""    # 批量 图片理解
+    last_batch_agg: str = ""       # 批量 聚合 AI
+    chat_font_family: str = ""    # 对话字体（空=默认）
+    chat_font_scale: int = 100    # 字体缩放百分比
     theme: str = "dark"
     resolution_scale: str = "原始"
     sample_rate: int = 16000

@@ -69,6 +69,9 @@ class MainWindow(QMainWindow):
                 self.setStyleSheet(build_stylesheet(self._theme))
                 self.theme_btn.setText("Light" if self._theme == "dark" else "Dark")
             self._refresh_from_settings()
+            self.chat_widget.apply_font_settings(
+                self.settings.chat_font_family, self.settings.chat_font_scale
+            )
 
     def _refresh_from_settings(self):
         self._refresh_provider_combo()
@@ -135,6 +138,9 @@ class MainWindow(QMainWindow):
 
         from src.gui.chat_widget import ChatWidget
         self.chat_widget = ChatWidget()
+        self.chat_widget.apply_font_settings(
+            self.settings.chat_font_family, self.settings.chat_font_scale
+        )
         self.top_tabs.addTab(distill_page, "  蒸馏  ")
         self.top_tabs.addTab(self._build_batch_tab(), "  批量蒸馏  ")
         self.top_tabs.addTab(self.chat_widget, "  对话  ")
@@ -282,8 +288,17 @@ class MainWindow(QMainWindow):
         return page
 
     def _refresh_batch_combos(self):
-        """填充批量蒸馏的 4 个模型下拉框"""
+        """填充批量蒸馏的 4 个模型下拉框，恢复上次选择"""
         s = self.settings
+
+        combos = [
+            (self.batch_asr_combo, "last_batch_asr"),
+            (self.batch_select_combo, "last_batch_select"),
+            (self.batch_vision_combo, "last_batch_vision"),
+            (self.batch_agg_combo, "last_batch_agg"),
+        ]
+        for combo, _ in combos:
+            combo.blockSignals(True)
 
         # 语音转录
         self.batch_asr_combo.clear()
@@ -312,6 +327,14 @@ class MainWindow(QMainWindow):
         for p in s.providers:
             if p.get("api_key"):
                 self.batch_agg_combo.addItem(f"{p['name']} ({p['model']})", p)
+
+        # 恢复上次选择 + 绑定保存
+        for combo, attr in combos:
+            self._restore_combo(combo, getattr(s, attr, ""))
+            combo.blockSignals(False)
+            combo.currentTextChanged.connect(
+                lambda t, a=attr, c=combo: self._save_combo(a, c)
+            )
 
     def _batch_add_videos(self):
         paths, _ = QFileDialog.getOpenFileNames(
@@ -838,47 +861,80 @@ class MainWindow(QMainWindow):
 
     # ─── 辅助 ───
 
+    @staticmethod
+    def _restore_combo(combo: QComboBox, saved_text: str):
+        """按文本匹配恢复上次选择"""
+        if saved_text:
+            idx = combo.findText(saved_text)
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+
+    def _save_combo(self, attr_name: str, combo: QComboBox):
+        """combo 变化时保存选择到 settings"""
+        text = combo.currentText()
+        if text != getattr(self.settings, attr_name, ""):
+            setattr(self.settings, attr_name, text)
+            save_settings(self.settings)
+
     def _refresh_provider_combo(self):
+        self.provider_combo.blockSignals(True)
+        saved = self.settings.last_agg_provider
         self.provider_combo.clear()
         self.provider_combo.addItem("手动模式")
         for p in self.settings.providers:
             self.provider_combo.addItem(f"{p['name']} ({p['model']})", p)
+        self._restore_combo(self.provider_combo, saved)
+        self.provider_combo.blockSignals(False)
+        self.provider_combo.currentIndexChanged.connect(self._on_provider_changed)
+        self.provider_combo.currentTextChanged.connect(
+            lambda t: self._save_combo("last_agg_provider", self.provider_combo)
+        )
 
     def _refresh_model_combo(self):
+        self.model_combo.blockSignals(True)
+        saved = self.settings.last_asr_model
         self.model_combo.clear()
         if self.settings.asr_type == "cloud":
             for c in self.settings.asr_cloud_configs:
                 self.model_combo.addItem(f"{c['name']} ({c['model']})")
-            for i, c in enumerate(self.settings.asr_cloud_configs):
-                if c["name"] == self.settings.asr_cloud_active:
-                    self.model_combo.setCurrentIndex(i)
-                    break
         else:
             from src.config import WHISPER_MODELS
             self.model_combo.addItems(WHISPER_MODELS)
-            idx = self.model_combo.findText(self.settings.whisper_model)
-            if idx >= 0:
-                self.model_combo.setCurrentIndex(idx)
+        self._restore_combo(self.model_combo, saved)
+        self.model_combo.blockSignals(False)
+        self.model_combo.currentTextChanged.connect(
+            lambda t: self._save_combo("last_asr_model", self.model_combo)
+        )
 
     def _refresh_select_provider_combo(self):
         if not hasattr(self, 'select_provider_combo'):
             return
+        self.select_provider_combo.blockSignals(True)
+        saved = self.settings.last_select_provider
         self.select_provider_combo.clear()
         for p in self.settings.providers:
             if p.get("api_key"):
                 self.select_provider_combo.addItem(f"{p['name']} ({p['model']})", p)
+        self._restore_combo(self.select_provider_combo, saved)
+        self.select_provider_combo.blockSignals(False)
+        self.select_provider_combo.currentTextChanged.connect(
+            lambda t: self._save_combo("last_select_provider", self.select_provider_combo)
+        )
 
     def _refresh_vision_combo(self):
         if not hasattr(self, 'vision_model_combo'):
             return
+        self.vision_model_combo.blockSignals(True)
+        saved = self.settings.vision_active
         self.vision_model_combo.clear()
         for v in self.settings.vision_models:
             tag = "本地" if v["type"] == "ollama" else "云端"
             self.vision_model_combo.addItem(f"{v['name']} [{tag}]", v)
-        for i, v in enumerate(self.settings.vision_models):
-            if v.get("name") == self.settings.vision_active:
-                self.vision_model_combo.setCurrentIndex(i)
-                break
+        self._restore_combo(self.vision_model_combo, saved)
+        self.vision_model_combo.blockSignals(False)
+        self.vision_model_combo.currentTextChanged.connect(
+            lambda t: self._save_combo("vision_active", self.vision_model_combo)
+        )
 
     @staticmethod
     def _label(text):
@@ -1559,35 +1615,39 @@ class _BatchWorker(QThread):
                 if self._cancel:
                     break
 
-                # Step 4: 图片理解
-                self.log.emit(f"  Step 4 图片理解...")
+                # Step 4: 图片理解（0 帧则跳过）
                 key_frames_dir = os.path.join(project_dir, "key_frames")
-                vision_cfg = dict(self.vision_config) if self.vision_config else {}
-                if not vision_cfg.get("url"):
-                    vision_cfg["url"] = s.ollama_url
+                has_slides = select_result['selected'] > 0 and os.path.exists(key_frames_dir) and list(Path(key_frames_dir).glob("*.jpg"))
 
-                # 加载 transcript 作为上下文
-                transcript_segments = []
-                try:
-                    with open(transcript_path, "r", encoding="utf-8") as f:
-                        tdata = json.load(f)
-                    transcript_segments = tdata.get("segments", [])
-                except Exception:
-                    pass
+                if has_slides:
+                    self.log.emit(f"  Step 4 图片理解...")
+                    vision_cfg = dict(self.vision_config) if self.vision_config else {}
+                    if not vision_cfg.get("url"):
+                        vision_cfg["url"] = s.ollama_url
 
-                prompts = {
-                    "ocr": s.vision_prompt_ocr,
-                    "diagram": s.vision_prompt_diagram,
-                    "title": s.vision_prompt_title,
-                    "single": s.vision_prompt_single,
-                }
+                    transcript_segments = []
+                    try:
+                        with open(transcript_path, "r", encoding="utf-8") as f:
+                            tdata = json.load(f)
+                        transcript_segments = tdata.get("segments", [])
+                    except Exception:
+                        pass
 
-                analyze_images(
-                    key_frames_dir, project_dir, vision_cfg, prompts,
-                    progress_cb=self._step_progress_cb(step_weights, i, total, 3),
-                    transcript_segments=transcript_segments,
-                )
-                self.log.emit(f"  Step 4 完成")
+                    prompts = {
+                        "ocr": s.vision_prompt_ocr,
+                        "diagram": s.vision_prompt_diagram,
+                        "title": s.vision_prompt_title,
+                        "single": s.vision_prompt_single,
+                    }
+
+                    analyze_images(
+                        key_frames_dir, project_dir, vision_cfg, prompts,
+                        progress_cb=self._step_progress_cb(step_weights, i, total, 3),
+                        transcript_segments=transcript_segments,
+                    )
+                    self.log.emit(f"  Step 4 完成")
+                else:
+                    self.log.emit(f"  Step 4 跳过（无关键帧，仅使用转录）")
 
                 if self._cancel:
                     break

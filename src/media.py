@@ -21,11 +21,21 @@ def find_ffmpeg() -> str:
                 return cmd
         except Exception:
             continue
-    for p in (r"C:\ffmpeg\bin\ffmpeg.exe",):
+    # 平台常见的非 PATH 安装路径
+    candidates = []
+    if os.name == "nt":
+        candidates.append(r"C:\ffmpeg\bin\ffmpeg.exe")
+    else:
+        candidates.extend([
+            "/opt/homebrew/bin/ffmpeg",
+            "/usr/local/bin/ffmpeg",
+        ])
+    for p in candidates:
         if os.path.exists(p):
             return p
     raise FileNotFoundError(
-        "未找到 FFmpeg。请安装 FFmpeg 并添加到 PATH，或放置到 C:\\ffmpeg\\bin\\"
+        "未找到 FFmpeg。请安装 FFmpeg 并添加到 PATH"
+        + ("，或放置到 C:\\ffmpeg\\bin\\" if os.name == "nt" else " (brew install ffmpeg)")
     )
 
 
