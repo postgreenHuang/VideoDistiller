@@ -151,8 +151,19 @@ def _parse_json_response(text: str) -> dict:
     return {"type": "", "title": "", "text": text, "layout": "", "diagrams": ""}
 
 
-def _write_slides(output_dir: str, slides: list, model: str, tokens: dict) -> str:
-    """将当前 slides 列表写入 slides.json，返回文件路径"""
+def _write_slides(output_dir: str, slides: list, model: str, tokens: dict,
+                  unified_json_path: str = "") -> str:
+    """将当前 slides 列表写入统一 JSON（或回退到 slides.json），返回文件路径"""
+    if unified_json_path:
+        from src.config import read_unified_json, write_unified_json
+        data = read_unified_json(unified_json_path)
+        data["slides"] = slides
+        data["vision_model"] = model
+        data["total_slides"] = len(slides)
+        data["vision_tokens"] = tokens
+        write_unified_json(unified_json_path, data)
+        return unified_json_path
+    # 回退：无统一路径时写 slides.json
     out_path = os.path.join(output_dir, "slides.json")
     data = {
         "slides": slides,
@@ -174,6 +185,7 @@ def analyze_images(
     cancel_flag: Optional[dict] = None,
     token_cb: Optional[Callable[[dict], None]] = None,
     transcript_segments: Optional[list] = None,
+    unified_json_path: str = "",
 ) -> dict:
     """
     分析关键帧图片，生成 slides.json（增量写入）
@@ -278,12 +290,12 @@ def analyze_images(
             import gc
             gc.collect()
 
-        _write_slides(output_dir, slides, model, accumulated_tokens)
+        _write_slides(output_dir, slides, model, accumulated_tokens, unified_json_path)
 
         if progress_cb:
             progress_cb((i + 1) / total)
 
-    out_path = os.path.join(output_dir, "slides.json")
+    out_path = unified_json_path or os.path.join(output_dir, "slides.json")
     return {
         "slides": slides,
         "model": model,

@@ -369,6 +369,7 @@ def _transcribe_multimodal(
 def transcribe(
     audio_path: str,
     output_dir: str,
+    video_path: str = "",
     asr_type: str = "local",
     model: str = "large-v3",
     language: Optional[str] = None,
@@ -403,29 +404,43 @@ def transcribe(
         )
         used_model = model
 
+    # 保留 transcript 子目录兼容旧逻辑
     transcript_dir = os.path.join(output_dir, "transcript")
     os.makedirs(transcript_dir, exist_ok=True)
 
     total_duration = segments[-1]["end"] if segments else 0.0
-    result = {
-        "segments": segments,
-        "metadata": {
-            "asr_type": asr_type,
-            "model": used_model,
-            "language": language or "auto",
-            "initial_prompt": vocabulary or "",
-            "segment_length": segment_length,
-            "total_duration": round(total_duration, 2),
-            "total_segments": len(segments),
-            "total_chars": sum(len(s["text"]) for s in segments),
-        },
+    metadata = {
+        "asr_type": asr_type,
+        "model": used_model,
+        "language": language or "auto",
+        "initial_prompt": vocabulary or "",
+        "segment_length": segment_length,
+        "total_duration": round(total_duration, 2),
+        "total_segments": len(segments),
+        "total_chars": sum(len(s["text"]) for s in segments),
     }
 
-    out_path = os.path.join(transcript_dir, "transcript.json")
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
+    result = {
+        "segments": segments,
+        "metadata": metadata,
+    }
 
-    result["output"] = out_path
+    # 写入统一 JSON（{video_name}.json）
+    if video_path:
+        from src.config import get_unified_json_path, read_unified_json, write_unified_json
+        unified_path = get_unified_json_path(os.path.dirname(output_dir) if os.path.basename(output_dir) == Path(video_path).stem else output_dir, video_path)
+        data = read_unified_json(unified_path)
+        data["segments"] = segments
+        data["metadata"] = metadata
+        write_unified_json(unified_path, data)
+        result["output"] = str(unified_path)
+    else:
+        # 兼容：没有 video_path 时写入旧路径
+        out_path = os.path.join(transcript_dir, "transcript.json")
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(result, f, ensure_ascii=False, indent=2)
+        result["output"] = out_path
+
     return result
 
 

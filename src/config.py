@@ -197,6 +197,31 @@ def get_project_dir(output_dir: str, video_path: str) -> Path:
     return project_dir
 
 
+def get_unified_json_path(output_dir: str, video_path: str) -> Path:
+    """返回统一 JSON 路径: {project_dir}/{video_name}.json"""
+    name = Path(video_path).stem
+    return Path(output_dir) / name / f"{name}.json"
+
+
+def read_unified_json(json_path: str | Path) -> dict:
+    """读取统一 JSON，不存在则返回空字典"""
+    p = Path(json_path)
+    if p.exists():
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def write_unified_json(json_path: str | Path, data: dict):
+    """写入统一 JSON"""
+    Path(json_path).write_text(
+        json.dumps(data, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
 def load_vocab_file(path: str) -> str:
     try:
         return Path(path).read_text(encoding="utf-8").strip()

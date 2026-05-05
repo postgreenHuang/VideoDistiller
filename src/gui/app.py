@@ -631,9 +631,9 @@ class MainWindow(QMainWindow):
         top.setSpacing(6)
         top.setColumnStretch(1, 1)
 
-        top.addWidget(self._label("图片数据"), 0, 0)
+        top.addWidget(self._label("数据源"), 0, 0)
         self.slides_json_edit = QLineEdit()
-        self.slides_json_edit.setPlaceholderText("自动读取: {项目}/slides.json")
+        self.slides_json_edit.setPlaceholderText("自动读取: {项目}/{视频名}.json")
         top.addWidget(self.slides_json_edit, 0, 1)
         btn_slides = QPushButton("浏览")
         btn_slides.setProperty("class", "secondary")
@@ -641,15 +641,10 @@ class MainWindow(QMainWindow):
         btn_slides.clicked.connect(self._browse_slides_json)
         top.addWidget(btn_slides, 0, 2)
 
-        top.addWidget(self._label("转录数据"), 1, 0)
+        # transcript_path_edit 隐藏但保留，用于兼容 _GenerateWorker
         self.transcript_path_edit = QLineEdit()
-        self.transcript_path_edit.setPlaceholderText("自动读取: {项目}/transcript/transcript.json")
-        top.addWidget(self.transcript_path_edit, 1, 1)
-        btn_transcript = QPushButton("浏览")
-        btn_transcript.setProperty("class", "secondary")
-        btn_transcript.setFixedWidth(56)
-        btn_transcript.clicked.connect(self._browse_transcript_json)
-        top.addWidget(btn_transcript, 1, 2)
+        self.transcript_path_edit.hide()
+        self._transcript_row_widget = None  # 不再显示第二行
 
         top.addWidget(self._label("Provider"), 2, 0)
         prov_row = QHBoxLayout()
@@ -707,17 +702,16 @@ class MainWindow(QMainWindow):
 
     def _on_export_data(self):
         """手动模式：将 slides + transcript 合并为 Markdown 导出到剪贴板"""
-        slides_path = self.slides_json_edit.text().strip()
-        transcript_path = self.transcript_path_edit.text().strip()
-        if not slides_path and not transcript_path:
+        json_path = self.slides_json_edit.text().strip()
+        if not json_path or not os.path.exists(json_path):
             self.generate_status.setText("没有可用的数据源")
             return
 
-        from pathlib import Path
+        data = json.loads(Path(json_path).read_text(encoding="utf-8"))
         parts = []
-        if slides_path and os.path.exists(slides_path):
-            data = json.loads(Path(slides_path).read_text(encoding="utf-8"))
-            slides = data.get("slides", [])
+
+        slides = data.get("slides", [])
+        if slides:
             parts.append("## 幻灯片描述\n")
             for s in slides:
                 ts = s.get("timestamp", "")
@@ -731,9 +725,8 @@ class MainWindow(QMainWindow):
                     line += f"\n图表: {diagrams}"
                 parts.append(line + "\n")
 
-        if transcript_path and os.path.exists(transcript_path):
-            data = json.loads(Path(transcript_path).read_text(encoding="utf-8"))
-            segments = data.get("segments", [])
+        segments = data.get("segments", [])
+        if segments:
             parts.append("\n## 语音转录\n")
             for seg in segments:
                 start = seg.get("start", 0)
@@ -769,12 +762,13 @@ class MainWindow(QMainWindow):
         project_dir = str(get_project_dir(output_dir, video_path))
 
         slides_path = self.slides_json_edit.text().strip()
-        transcript_path = self.transcript_path_edit.text().strip()
+        transcript_path = slides_path  # 统一 JSON 同时作为 transcript 路径
+        self.transcript_path_edit.setText(transcript_path)
         prompt = self.prompt_edit.toPlainText().strip()
         if not prompt:
             prompt = self.settings.default_distill_prompt
 
-        if not slides_path and not transcript_path:
+        if not slides_path:
             self.generate_status.setText("没有可用的数据源，请先完成前面的步骤")
             return
 
@@ -834,16 +828,10 @@ class MainWindow(QMainWindow):
 
     def _browse_slides_json(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "选择 slides.json", "", "JSON (*.json)"
+            self, "选择数据 JSON", "", "JSON (*.json)"
         )
         if path:
             self.slides_json_edit.setText(path)
-
-    def _browse_transcript_json(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "选择 transcript.json", "", "JSON (*.json)"
-        )
-        if path:
             self.transcript_path_edit.setText(path)
 
     def _auto_fill_step5_paths(self):
@@ -851,13 +839,14 @@ class MainWindow(QMainWindow):
         output_dir = self.output_dir_edit.text().strip()
         if not video_path or not output_dir:
             return
-        project_dir = Path(output_dir) / Path(video_path).stem
-        slides_json = project_dir / "slides.json"
-        transcript_json = project_dir / "transcript" / "transcript.json"
-        if slides_json.exists():
-            self.slides_json_edit.setText(str(slides_json))
-        if transcript_json.exists():
-            self.transcript_path_edit.setText(str(transcript_json))
+        from src.config import get_unified_json_path
+        unified_json = get_unified_json_path(output_dir, video_path)
+        if unified_json.exists():
+            self.slides_json_edit.setText(str(unified_json))
+            self.transcript_path_edit.setText(str(unified_json))
+        else:
+            self.slides_json_edit.clear()
+            self.transcript_path_edit.clear()
 
     # ─── 辅助 ───
 
@@ -996,14 +985,27 @@ class MainWindow(QMainWindow):
             return
 
         frames_dir = project_dir / "frames"
-        transcript_path = project_dir / "transcript" / "transcript.json"
+        video_path = self.video_path_edit.text().strip()
+        output_dir = self.output_dir_edit.text().strip()
 
         if not frames_dir.exists() or not list(frames_dir.glob("*.jpg")):
             self.select_status.setText("frames 目录为空，请先完成 Step 1 帧提取")
             return
 
-        if not transcript_path.exists():
-            self.select_status.setText("未找到 transcript.json，请先完成 Step 2 转录")
+        # 查找 transcript 数据路径（统一 JSON 或旧格式）
+        transcript_path = ""
+        if video_path and output_dir:
+            from src.config import get_unified_json_path
+            unified = get_unified_json_path(output_dir, video_path)
+            if unified.exists():
+                transcript_path = str(unified)
+        if not transcript_path:
+            old_path = project_dir / "transcript" / "transcript.json"
+            if old_path.exists():
+                transcript_path = str(old_path)
+
+        if not transcript_path:
+            self.select_status.setText("未找到转录数据，请先完成 Step 2 转录")
             return
 
         # 从下拉框获取选中的 provider
@@ -1140,17 +1142,35 @@ class MainWindow(QMainWindow):
             "single": s.vision_prompt_single,
         }
 
-        # 尝试加载 transcript.json 作为上下文
+        # 尝试加载 transcript 作为上下文
         transcript_segments = []
-        transcript_path = project_dir / "transcript" / "transcript.json"
-        if transcript_path.exists():
-            import json
-            try:
-                with open(transcript_path, "r", encoding="utf-8") as f:
-                    tdata = json.load(f)
-                transcript_segments = tdata.get("segments", [])
-            except Exception:
-                pass
+        video_path = self.video_path_edit.text().strip()
+        output_dir = self.output_dir_edit.text().strip()
+        if video_path and output_dir:
+            from src.config import get_unified_json_path
+            unified_path = get_unified_json_path(output_dir, video_path)
+            if unified_path.exists():
+                try:
+                    tdata = json.loads(unified_path.read_text(encoding="utf-8"))
+                    transcript_segments = tdata.get("segments", [])
+                except Exception:
+                    pass
+            else:
+                # 回退兼容旧格式
+                transcript_path = project_dir / "transcript" / "transcript.json"
+                if transcript_path.exists():
+                    try:
+                        with open(transcript_path, "r", encoding="utf-8") as f:
+                            tdata = json.load(f)
+                        transcript_segments = tdata.get("segments", [])
+                    except Exception:
+                        pass
+
+        # 获取统一 JSON 路径用于写入
+        unified_json_path = ""
+        if video_path and output_dir:
+            from src.config import get_unified_json_path
+            unified_json_path = str(get_unified_json_path(output_dir, video_path))
 
         self.analysis_progress.setValue(0)
         self.token_label.setText(" ")
@@ -1161,7 +1181,7 @@ class MainWindow(QMainWindow):
 
         self._vision_worker = _VisionWorker(
             str(key_frames_dir), str(project_dir), vision_config, prompts,
-            transcript_segments,
+            transcript_segments, unified_json_path,
         )
         self._vision_worker.progress.connect(
             lambda v: self.analysis_progress.setValue(int(v * 100))
@@ -1250,6 +1270,7 @@ class MainWindow(QMainWindow):
             model, language, vocabulary, s.segment_length,
             asr_api_url, asr_api_key, asr_api_type,
             progress_cb=lambda v: self.transcribe_progress.setValue(int(v * 100)),
+            video_path=self.video_path_edit.text().strip(),
         )
         self._transcribe_worker.progress.connect(lambda v: self.transcribe_progress.setValue(int(v * 100)))
         self._transcribe_worker.finished.connect(self._on_transcribe_done)
@@ -1342,7 +1363,7 @@ class _TranscribeWorker(QThread):
 
     def __init__(self, audio_path, project_dir, asr_type, model, language,
                  vocabulary, segment_length, asr_api_url, asr_api_key,
-                 asr_api_type="whisper", progress_cb=None):
+                 asr_api_type="whisper", progress_cb=None, video_path=""):
         super().__init__()
         self.audio_path = audio_path
         self.project_dir = project_dir
@@ -1356,6 +1377,7 @@ class _TranscribeWorker(QThread):
         self.asr_api_type = asr_api_type
         self.result = None
         self._progress_cb = progress_cb
+        self.video_path = video_path
 
     def run(self):
         from src.transcribe import transcribe
@@ -1363,6 +1385,7 @@ class _TranscribeWorker(QThread):
             self.result = transcribe(
                 audio_path=self.audio_path,
                 output_dir=self.project_dir,
+                video_path=self.video_path,
                 asr_type=self.asr_type,
                 model=self.model,
                 language=self.language,
@@ -1385,7 +1408,7 @@ class _VisionWorker(QThread):
     finished = Signal(bool, str)
 
     def __init__(self, key_frames_dir, output_dir, vision_config, prompts,
-                 transcript_segments=None):
+                 transcript_segments=None, unified_json_path=""):
         super().__init__()
         self.key_frames_dir = key_frames_dir
         self.output_dir = output_dir
@@ -1394,6 +1417,7 @@ class _VisionWorker(QThread):
         self.transcript_segments = transcript_segments or []
         self._cancel_flag = {"cancel": False}
         self.result = None
+        self.unified_json_path = unified_json_path
 
     def cancel(self):
         self._cancel_flag["cancel"] = True
@@ -1408,6 +1432,7 @@ class _VisionWorker(QThread):
                 cancel_flag=self._cancel_flag,
                 token_cb=lambda d: self.token_update.emit(d),
                 transcript_segments=self.transcript_segments,
+                unified_json_path=self.unified_json_path,
             )
             self.result = result
             self.finished.emit(True, "")
@@ -1437,12 +1462,26 @@ class _GenerateWorker(QThread):
 
             slides_text = ""
             transcript_text = ""
+
+            # 从统一 JSON 读取
             if self.slides_path and os.path.exists(self.slides_path):
                 data = json.loads(Path(self.slides_path).read_text(encoding="utf-8"))
-                slides_text = json.dumps(data, ensure_ascii=False, indent=2)
-            if self.transcript_path and os.path.exists(self.transcript_path):
-                data = json.loads(Path(self.transcript_path).read_text(encoding="utf-8"))
-                transcript_text = json.dumps(data, ensure_ascii=False, indent=2)
+                slides = data.get("slides", [])
+                segments = data.get("segments", [])
+                if slides:
+                    slides_text = json.dumps(slides, ensure_ascii=False, indent=2)
+                if segments:
+                    transcript_text = json.dumps(segments, ensure_ascii=False, indent=2)
+
+            # 回退：如果统一 JSON 中没数据，尝试旧格式
+            if not slides_text and self.slides_path != self.transcript_path:
+                if self.slides_path and os.path.exists(self.slides_path):
+                    data = json.loads(Path(self.slides_path).read_text(encoding="utf-8"))
+                    slides_text = json.dumps(data, ensure_ascii=False, indent=2)
+            if not transcript_text and self.slides_path != self.transcript_path:
+                if self.transcript_path and os.path.exists(self.transcript_path):
+                    data = json.loads(Path(self.transcript_path).read_text(encoding="utf-8"))
+                    transcript_text = json.dumps(data, ensure_ascii=False, indent=2)
 
             if not slides_text and not transcript_text:
                 self.error.emit("没有可用的数据源")
@@ -1585,6 +1624,7 @@ class _BatchWorker(QThread):
                 transcribe(
                     audio_path=audio_path,
                     output_dir=project_dir,
+                    video_path=video_path,
                     asr_type=asr_type,
                     model=model,
                     language=language,
@@ -1603,7 +1643,12 @@ class _BatchWorker(QThread):
 
                 # Step 3: 智能选帧
                 self.log.emit(f"  Step 3 智能选帧...")
-                transcript_path = os.path.join(project_dir, "transcript", "transcript.json")
+                # 使用统一 JSON 路径，回退旧格式
+                unified_path = os.path.join(project_dir, f"{name}.json")
+                if os.path.exists(unified_path):
+                    transcript_path = unified_path
+                else:
+                    transcript_path = os.path.join(project_dir, "transcript", "transcript.json")
                 frames_dir = os.path.join(project_dir, "frames")
                 select_result = select_frames(
                     transcript_path, frames_dir, project_dir,
@@ -1640,10 +1685,13 @@ class _BatchWorker(QThread):
                         "single": s.vision_prompt_single,
                     }
 
+                    # 使用统一 JSON 路径写入
+                    unified_json = os.path.join(project_dir, f"{name}.json")
                     analyze_images(
                         key_frames_dir, project_dir, vision_cfg, prompts,
                         progress_cb=self._step_progress_cb(step_weights, i, total, 3),
                         transcript_segments=transcript_segments,
+                        unified_json_path=unified_json,
                     )
                     self.log.emit(f"  Step 4 完成")
                 else:
@@ -1654,14 +1702,29 @@ class _BatchWorker(QThread):
 
                 # Step 5: AI 聚合
                 self.log.emit(f"  Step 5 AI 聚合...")
-                slides_path = os.path.join(project_dir, "slides.json")
 
                 slides_text = ""
                 transcript_text = ""
-                if os.path.exists(slides_path):
-                    slides_text = Path(slides_path).read_text(encoding="utf-8")
-                if os.path.exists(transcript_path):
-                    transcript_text = Path(transcript_path).read_text(encoding="utf-8")
+                # 从统一 JSON 读取
+                unified_json = os.path.join(project_dir, f"{name}.json")
+                if os.path.exists(unified_json):
+                    udata = json.loads(Path(unified_json).read_text(encoding="utf-8"))
+                    slides = udata.get("slides", [])
+                    segments = udata.get("segments", [])
+                    if slides:
+                        slides_text = json.dumps(slides, ensure_ascii=False, indent=2)
+                    if segments:
+                        transcript_text = json.dumps(segments, ensure_ascii=False, indent=2)
+
+                # 回退旧格式
+                if not slides_text:
+                    slides_path = os.path.join(project_dir, "slides.json")
+                    if os.path.exists(slides_path):
+                        slides_text = Path(slides_path).read_text(encoding="utf-8")
+                if not transcript_text:
+                    old_transcript = os.path.join(project_dir, "transcript", "transcript.json")
+                    if os.path.exists(old_transcript):
+                        transcript_text = Path(old_transcript).read_text(encoding="utf-8")
 
                 prompt = s.default_distill_prompt
                 base_url = self.agg_provider.get("base_url", "").rstrip("/")

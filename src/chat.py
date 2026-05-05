@@ -193,6 +193,7 @@ class ChatSession:
             return ""
         try:
             data = json.loads(Path(path).read_text(encoding="utf-8"))
+            # 兼容统一 JSON（data 包含 slides 键）和旧 slides.json
             slides = data.get("slides", [])
             lines = []
             for s in slides:
@@ -206,6 +207,17 @@ class ChatSession:
                 if diagrams and diagrams != "无":
                     line += f" | 图表: {diagrams[:100]}"
                 lines.append(line)
+
+            # 如果统一 JSON 中还有 segments，追加转录摘要
+            segments = data.get("segments", [])
+            if segments and not slides:
+                lines.append("\n## 语音转录摘要")
+                for seg in segments[:10]:
+                    start_mmss = seg.get("start_mmss", "")
+                    text = seg.get("text", "")[:100]
+                    if start_mmss and text:
+                        lines.append(f"[{start_mmss}] {text}")
+
             return "\n".join(lines)
         except Exception:
             return ""
@@ -237,12 +249,30 @@ def create_session(project_dir: str, video_name: str = "",
                     notes_path = os.path.join(notes_dir, f)
                     break
 
-    slides_path = os.path.join(project_dir, "slides.json")
-    if not os.path.exists(slides_path):
-        slides_path = ""
-    transcript_path = os.path.join(project_dir, "transcript", "transcript.json")
-    if not os.path.exists(transcript_path):
-        transcript_path = ""
+    # 查找统一 JSON（{video_name}.json）
+    slides_path = ""
+    transcript_path = ""
+    unified_candidates = [f for f in os.listdir(project_dir) if f.endswith(".json") and not f.startswith(".")]
+    for uc in unified_candidates:
+        p = os.path.join(project_dir, uc)
+        try:
+            data = json.loads(Path(p).read_text(encoding="utf-8"))
+            if "segments" in data or "slides" in data:
+                slides_path = p
+                transcript_path = p
+                break
+        except Exception:
+            continue
+
+    # 回退旧格式
+    if not slides_path:
+        slides_path = os.path.join(project_dir, "slides.json")
+        if not os.path.exists(slides_path):
+            slides_path = ""
+    if not transcript_path:
+        transcript_path = os.path.join(project_dir, "transcript", "transcript.json")
+        if not os.path.exists(transcript_path):
+            transcript_path = ""
 
     session.initialize(notes_path, slides_path, transcript_path)
 

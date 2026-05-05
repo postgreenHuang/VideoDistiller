@@ -1,5 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 import os
+import sys
 
 a = Analysis(
     ['main.py'],
@@ -58,3 +59,16 @@ coll = COLLECT(
     upx=False,
     name='Video-Distiller',
 )
+
+# macOS: 生成 .app bundle
+if sys.platform == 'darwin':
+    app = BUNDLE(
+        coll,
+        name='Video-Distiller.app',
+        icon=None,
+        bundle_identifier='com.videodistiller.app',
+        info_plist={
+            'NSHighResolutionCapable': True,
+            'CFBundleShortVersionString': '2.0.0',
+        },
+    )
