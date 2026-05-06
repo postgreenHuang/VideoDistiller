@@ -17,6 +17,7 @@
 VideoSteamer/
 ├── src/
 │   ├── config.py           # 配置管理 (settings.json)
+│   ├── pipeline.py         # 管线编排 (5 阶段顺序/并发调度)
 │   ├── media.py            # ① MP3 提取 + ② 帧提取 (FFmpeg)
 │   ├── frame_selector.py   # ③ AI 智能选帧 (转录语义分析替代 SSIM)
 │   ├── visual.py           # (备用) SSIM/pHash 去重
@@ -25,7 +26,7 @@ VideoSteamer/
 │   ├── chat.py             # ⑥ AI 对话会话管理
 │   └── gui/
 │       ├── app.py          # 主窗口 (两 Tab: 蒸馏 + 对话)
-│       ├── chat_widget.py  # AI 对话界面
+│       ├── chat_widget.py  # AI 对话界面 (MessageBubble = QTextBrowser)
 │       ├── theme.py        # Light/Dark 主题 QSS
 │       └── settings_dialog.py
 ├── output/{project_name}/
@@ -172,7 +173,40 @@ requests, Pillow, pyinstaller, numpy, dashscope
 
 ## 当前硬件
 
-i9-11代 / 64GB RAM / CPU only (faster-whisper 用 int8)
+i9-11代 / 64GB RAM / NVIDIA RTX 3090 24GB VRAM
+- Ollama 可用 CUDA 加速，视觉模型可本地跑
+- faster-whisper 可用 CUDA（当前仍用 int8 CPU 模式）
+- 同时有 Mac 设备用于跨平台测试
+
+## 对话系统架构决策
+
+### 消息气泡：QTextBrowser（非 QLabel）
+
+- QLabel 的 RichText 不支持加载外部图片，`file:///` URL 无效
+- 改用 QTextBrowser，支持图片、链接点击、富文本交互
+- 图片通过 `QTextDocument.addResource(ImageResource, ...)` 预加载到文档缓存
+  - 在 `setHtml()` 之前调用 `_preload_images()`
+  - 绕过 `file:///` URL 加载机制（Windows 不可靠）
+- 每张图用唯一 key（`img_0`, `img_1`...）作为 src，映射到本地绝对路径
+- 支持三种图片引用格式：`file:///` 绝对 URL、相对文件名、`http/https/data` 外部链接
+
+### 连续图片横向排列
+
+- HTML 后处理 `_group_consecutive_images()` 检测连续 `<p><img/></p>` 并合并为一行
+- 每张图包裹 `<a href="imgview:///path">` 支持点击查看大图
+- `_ImageViewerDialog`：弹出窗口显示缩放后原图（不超过屏幕 85%）
+
+### 气泡高度自适应
+
+- 监听 `documentSizeChanged` 信号，`setFixedHeight(doc_h + 26)`（26 = 24px QSS padding + 2px buffer）
+- QTextBrowser 需要手动收缩高度，不像 QLabel 自动收缩
+
+### 对话 Session 管理
+
+- Session 持久化到 `~/.Video-Distiller/sessions/{timestamp}/`
+- 支持文件夹分组、移动、批量删除
+- 蒸馏笔记作为首条 assistant 消息注入对话
+- 齿轮按钮配置关联文件（notes.md + 数据 JSON）
 
 ---
 
@@ -222,3 +256,11 @@ i9-11代 / 64GB RAM / CPU only (faster-whisper 用 int8)
 ### 当前阶段
 
 **Phase A 待实施**，从 A1 开始。
+
+### 已完成的重构项（v2.0 之前）
+
+- 统一 JSON 输出：slides + transcript 合并为单文件
+- 对话 GUI 视觉优化：气泡样式、侧边栏 session 管理、文件夹分组
+- 跨平台适配：macOS 打包支持，字体按平台选择
+- AI 智能选帧：用转录语义分析替代 SSIM 去重（frame_selector.py）
+- 图片显示：QTextBrowser + addResource 方案，连续图片横向排列 + 点击查看大图

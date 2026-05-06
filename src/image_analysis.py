@@ -42,7 +42,7 @@ def _call_ollama(model: str, prompt: str, image_b64: str, base_url: str,
     }
     if context is not None:
         body["context"] = context
-    resp = requests.post(url, json=body, timeout=120)
+    resp = requests.post(url, json=body, timeout=300)
     resp.raise_for_status()
     data = resp.json()
     text = data.get("response", "").strip()
@@ -80,7 +80,7 @@ def _call_cloud(model: str, prompt: str, image_b64: str,
         ],
         "max_tokens": 1024,
     }
-    resp = requests.post(url, json=payload, headers=headers, timeout=120)
+    resp = requests.post(url, json=payload, headers=headers, timeout=300)
     resp.raise_for_status()
     data = resp.json()
     text = data["choices"][0]["message"]["content"].strip()
@@ -186,6 +186,7 @@ def analyze_images(
     token_cb: Optional[Callable[[dict], None]] = None,
     transcript_segments: Optional[list] = None,
     unified_json_path: str = "",
+    max_concurrent: int = 1,
 ) -> dict:
     """
     分析关键帧图片，生成 slides.json（增量写入）
@@ -217,24 +218,26 @@ def analyze_images(
     total = len(frames)
     cancelled = False
     accumulated_tokens = {"prompt": 0, "completion": 0, "total": 0, "calls": 0}
+    _lock = __import__("threading").Lock()
+    _done_count = [0]
 
     def _accumulate(tokens: dict, call_count: int = 1):
-        accumulated_tokens["prompt"] += tokens.get("prompt_tokens", 0)
-        accumulated_tokens["completion"] += tokens.get("completion_tokens", 0)
-        accumulated_tokens["total"] += tokens.get("total_tokens", 0)
-        accumulated_tokens["calls"] += call_count
-        if token_cb:
-            token_cb(dict(accumulated_tokens))
+        with _lock:
+            accumulated_tokens["prompt"] += tokens.get("prompt_tokens", 0)
+            accumulated_tokens["completion"] += tokens.get("completion_tokens", 0)
+            accumulated_tokens["total"] += tokens.get("total_tokens", 0)
+            accumulated_tokens["calls"] += call_count
+            if token_cb:
+                token_cb(dict(accumulated_tokens))
 
-    for i, frame_path in enumerate(frames):
+    def _process_frame(frame_path: Path) -> Optional[dict]:
+        """处理单帧，返回 slide dict 或 None（取消时）"""
         if cancel_flag and cancel_flag.get("cancel"):
-            cancelled = True
-            break
+            return None
 
         image_b64 = _encode_image(str(frame_path))
         timestamp = _parse_timestamp(frame_path.name)
 
-        # 从 transcript 获取当前时间点的讲者内容作为上下文
         ctx = ""
         if transcript_segments:
             ctx = _find_transcript_context(timestamp, transcript_segments)
@@ -247,7 +250,7 @@ def analyze_images(
             )
             _accumulate(tokens, 1)
             parsed = _parse_json_response(raw)
-            slides.append({
+            return {
                 "timestamp": timestamp,
                 "file": frame_path.name,
                 "type": parsed.get("type", ""),
@@ -255,9 +258,8 @@ def analyze_images(
                 "text": parsed.get("text", raw),
                 "layout": parsed.get("layout", ""),
                 "diagrams": parsed.get("diagrams", ""),
-            })
+            }
         else:
-            # 三步调用 — 复用 Ollama context，图片只编码一次
             ollama_ctx = None
             text, t1, ollama_ctx = _analyze_single(
                 vtype, model, context_prefix + prompts["ocr"],
@@ -274,7 +276,7 @@ def analyze_images(
             _accumulate(t1)
             _accumulate(t2)
             _accumulate(t3)
-            slides.append({
+            return {
                 "timestamp": timestamp,
                 "file": frame_path.name,
                 "type": "",
@@ -282,18 +284,55 @@ def analyze_images(
                 "text": text,
                 "layout": diagrams,
                 "diagrams": diagrams,
-            })
+            }
 
-        # 释放当前帧的内存
-        del image_b64
-        if i % 5 == 4:
-            import gc
-            gc.collect()
+    if max_concurrent <= 1:
+        # 串行模式（原逻辑）
+        for i, frame_path in enumerate(frames):
+            if cancel_flag and cancel_flag.get("cancel"):
+                cancelled = True
+                break
+            slide = _process_frame(frame_path)
+            if slide is None:
+                cancelled = True
+                break
+            slides.append(slide)
+            _write_slides(output_dir, slides, model, accumulated_tokens, unified_json_path)
+            if progress_cb:
+                progress_cb((i + 1) / total)
+    else:
+        # 并行模式
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        _write_slides(output_dir, slides, model, accumulated_tokens, unified_json_path)
+        with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
+            futures = {executor.submit(_process_frame, fp): i for i, fp in enumerate(frames)}
+            results: dict[int, dict] = {}
 
-        if progress_cb:
-            progress_cb((i + 1) / total)
+            for future in as_completed(futures):
+                if cancel_flag and cancel_flag.get("cancel"):
+                    cancelled = True
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    break
+
+                idx = futures[future]
+                try:
+                    slide = future.result()
+                    if slide is not None:
+                        results[idx] = slide
+                except Exception:
+                    pass
+
+                with _lock:
+                    _done_count[0] += 1
+                    if progress_cb:
+                        progress_cb(_done_count[0] / total)
+
+            # 按原始顺序组装
+            for idx in sorted(results.keys()):
+                slides.append(results[idx])
+
+        if slides:
+            _write_slides(output_dir, slides, model, accumulated_tokens, unified_json_path)
 
     out_path = unified_json_path or os.path.join(output_dir, "slides.json")
     return {

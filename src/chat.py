@@ -12,6 +12,22 @@ from pathlib import Path
 from typing import Optional
 
 _SESSIONS_DIR = Path.home() / ".Video-Distiller" / "sessions"
+_FOLDERS_FILE = Path.home() / ".Video-Distiller" / "folders.json"
+
+
+def load_folders() -> list[dict]:
+    if _FOLDERS_FILE.is_file():
+        try:
+            return json.loads(_FOLDERS_FILE.read_text(encoding="utf-8")).get("folders", [])
+        except Exception:
+            pass
+    return []
+
+
+def save_folders(folders: list[dict]):
+    _FOLDERS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(_FOLDERS_FILE, "w", encoding="utf-8") as f:
+        json.dump({"folders": folders}, f, ensure_ascii=False, indent=2)
 
 
 CHAT_SYSTEM_PROMPT = (
@@ -43,22 +59,21 @@ class ChatSession:
         # 元数据
         self.name = ""
         self.created_at = ""
+        self.folder_id = ""
         self.slides_path = ""
         self.transcript_path = ""
         self.notes_path = ""
 
-    def initialize(self, notes_path: str = "", slides_path: str = "",
-                   transcript_path: str = "") -> bool:
+    def initialize(self, notes_path: str = "", data_path: str = "") -> bool:
         """加蒸馏结果构建 system prompt，返回是否成功"""
         notes = self._read_file(notes_path)
-        slides = self._summarize_slides(slides_path)
+        slides = self._summarize_slides(data_path)
 
         if not notes and not slides:
             return False
 
         self.notes_path = notes_path
-        self.slides_path = slides_path
-        self.transcript_path = transcript_path
+        self.slides_path = data_path
         self.system_prompt = CHAT_SYSTEM_PROMPT.format(
             notes=notes or "(未找到蒸馏笔记)",
             slides=slides or "(未找到幻灯片描述)",
@@ -66,15 +81,13 @@ class ChatSession:
         self._load_history()
         return True
 
-    def update_files(self, notes_path: str = "", slides_path: str = "",
-                     transcript_path: str = ""):
+    def update_files(self, notes_path: str = "", data_path: str = ""):
         """更新关联文件并重建 system prompt"""
         self.notes_path = notes_path
-        self.slides_path = slides_path
-        self.transcript_path = transcript_path
+        self.slides_path = data_path
 
         notes = self._read_file(notes_path)
-        slides = self._summarize_slides(slides_path)
+        slides = self._summarize_slides(data_path)
 
         if notes or slides:
             self.system_prompt = CHAT_SYSTEM_PROMPT.format(
@@ -142,6 +155,7 @@ class ChatSession:
         data = {
             "name": self.name,
             "created_at": self.created_at,
+            "folder_id": self.folder_id,
             "slides_path": self.slides_path,
             "transcript_path": self.transcript_path,
             "notes_path": self.notes_path,
@@ -159,6 +173,7 @@ class ChatSession:
                 self.messages = data.get("messages", [])
                 self.name = data.get("name", self.name)
                 self.created_at = data.get("created_at", "")
+                self.folder_id = data.get("folder_id", "")
                 self.slides_path = data.get("slides_path", "")
                 self.transcript_path = data.get("transcript_path", "")
                 self.notes_path = data.get("notes_path", "")
@@ -249,32 +264,26 @@ def create_session(project_dir: str, video_name: str = "",
                     notes_path = os.path.join(notes_dir, f)
                     break
 
-    # 查找统一 JSON（{video_name}.json）
-    slides_path = ""
-    transcript_path = ""
+    # 查找统一 JSON（包含 slides 或 segments 的 JSON 文件）
+    data_path = ""
     unified_candidates = [f for f in os.listdir(project_dir) if f.endswith(".json") and not f.startswith(".")]
     for uc in unified_candidates:
         p = os.path.join(project_dir, uc)
         try:
             data = json.loads(Path(p).read_text(encoding="utf-8"))
             if "segments" in data or "slides" in data:
-                slides_path = p
-                transcript_path = p
+                data_path = p
                 break
         except Exception:
             continue
 
-    # 回退旧格式
-    if not slides_path:
-        slides_path = os.path.join(project_dir, "slides.json")
-        if not os.path.exists(slides_path):
-            slides_path = ""
-    if not transcript_path:
-        transcript_path = os.path.join(project_dir, "transcript", "transcript.json")
-        if not os.path.exists(transcript_path):
-            transcript_path = ""
+    # 回退旧格式 slides.json
+    if not data_path:
+        legacy = os.path.join(project_dir, "slides.json")
+        if os.path.exists(legacy):
+            data_path = legacy
 
-    session.initialize(notes_path, slides_path, transcript_path)
+    session.initialize(notes_path, data_path)
 
     # 名称：有笔记用笔记名，有视频名用视频名，否则用时间
     if session.notes_path:
@@ -330,9 +339,9 @@ def list_sessions() -> list[dict]:
             "session_id": sid,
             "session_dir": sdir,
             "rounds": rounds,
+            "folder_id": data.get("folder_id", ""),
             "created_at": data.get("created_at", ""),
             "slides_path": data.get("slides_path", ""),
-            "transcript_path": data.get("transcript_path", ""),
             "notes_path": data.get("notes_path", ""),
         })
     return results

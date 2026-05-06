@@ -7,17 +7,19 @@ Video-Distiller AI 对话界面
 import json
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import Qt, QThread, Signal, QTimer
-from PySide6.QtGui import QFont, QFontDatabase
+from PySide6.QtCore import Qt, QSize, QThread, Signal, QTimer
+from PySide6.QtGui import QFont, QFontDatabase, QTextDocument
 from PySide6.QtWidgets import (
+    QTreeWidgetItemIterator,
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QTextEdit, QScrollArea, QSizePolicy, QListWidget,
-    QListWidgetItem, QFrame, QComboBox, QFileDialog, QMenu,
-    QDialog, QGridLayout, QLineEdit, QDialogButtonBox,
-    QSplitter,
+    QTextEdit, QTextBrowser, QScrollArea, QSizePolicy,
+    QTreeWidget, QTreeWidgetItem, QFrame, QComboBox, QFileDialog,
+    QMenu, QDialog, QGridLayout, QLineEdit, QDialogButtonBox,
+    QInputDialog, QSplitter, QHeaderView,
 )
 
 from src.chat import ChatSession, create_empty_session, list_sessions
@@ -26,34 +28,150 @@ from src.chat import ChatSession, create_empty_session, list_sessions
 _THINKING_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
 
-class MessageBubble(QLabel):
+class _ImageViewerDialog(QDialog):
+    """点击图片后弹出的大图查看器"""
+    def __init__(self, image_path: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(os.path.basename(image_path))
+        from PySide6.QtGui import QPixmap
+        from PySide6.QtWidgets import QApplication
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        pixmap = QPixmap(image_path)
+        screen = QApplication.primaryScreen().availableGeometry()
+        max_w = int(screen.width() * 0.85)
+        max_h = int(screen.height() * 0.85)
+        if pixmap.width() > max_w or pixmap.height() > max_h:
+            pixmap = pixmap.scaled(max_w, max_h,
+                                   Qt.AspectRatioMode.KeepAspectRatio,
+                                   Qt.TransformationMode.SmoothTransformation)
+
+        label = QLabel()
+        label.setPixmap(pixmap)
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        label.setStyleSheet("background: #1a1a1a;")
+        layout.addWidget(label)
+        self.resize(pixmap.size())
+
+
+class MessageBubble(QTextBrowser):
     _font_family = ""
     _font_scale = 100
+    _base_dir = ""
+    _img_paths: dict = {}  # src_name → abs_path
 
     def __init__(self, role: str, text: str):
         super().__init__()
         self.setProperty("class", f"msg-{role}")
-        self.setWordWrap(True)
-        self._raw_text = text
-        self.setText(self._render_md(text, self._font_family, self._font_scale))
-        self.setTextFormat(Qt.TextFormat.RichText)
+        self.setReadOnly(True)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setOpenExternalLinks(False)
+        self.setOpenLinks(False)
         self.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        self._raw_text = text
+
+        html, img_map = self._render_md(text, self._font_family, self._font_scale)
+        # 预加载图片到文档资源缓存（在 setHtml 之前）
+        self._preload_images(img_map)
+        self.setHtml(html)
         self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
         self._sync_widget_font()
+        self.document().documentLayout().documentSizeChanged.connect(self._adjust_size)
+        self.anchorClicked.connect(self._on_anchor_clicked)
+
+    # ─── 尺寸自适应 ───
+
+    def _adjust_size(self):
+        doc_h = int(self.document().documentLayout().documentSize().height())
+        target = doc_h + 26
+        if abs(self.height() - target) > 2:
+            self.setFixedHeight(target)
+            self.updateGeometry()
+
+    # ─── 图片预加载到文档资源缓存 ───
+
+    def _preload_images(self, img_map: dict):
+        """在 setHtml 之前，把图片作为 ImageResource 注入文档缓存"""
+        from PySide6.QtGui import QPixmap
+        from PySide6.QtCore import QUrl
+
+        doc = self.document()
+        for src_key, abs_path in img_map.items():
+            pix = QPixmap(abs_path)
+            if not pix.isNull():
+                url = QUrl(src_key)
+                doc.addResource(QTextDocument.ResourceType.ImageResource, url, pix)
+
+    # ─── 图片点击查看大图 ───
+
+    def _on_anchor_clicked(self, url):
+        path = url.toLocalFile()
+        if not path and url.scheme() == "imgview":
+            path = url.path()
+            if sys.platform == "win32" and path.startswith("/"):
+                path = path[1:]
+        if path and os.path.isfile(path):
+            dlg = _ImageViewerDialog(path, self.window())
+            dlg.exec()
+
+    # ─── Markdown → HTML 渲染 ───
 
     @staticmethod
-    def _render_md(text: str, font_family: str, font_scale: int) -> str:
-        import re
-        from PySide6.QtGui import QTextDocument, QFont
+    def _find_image(src: str) -> str:
+        """在 base_dir 的 frames/ 和 key_frames/ 子目录中搜索图片，返回绝对路径或空串"""
+        if not MessageBubble._base_dir:
+            return ""
+        for subdir in ("frames", "key_frames", ""):
+            full = os.path.join(MessageBubble._base_dir, subdir, src) if subdir else os.path.join(MessageBubble._base_dir, src)
+            if os.path.isfile(full):
+                return full
+        return ""
 
-        doc = QTextDocument()
+    @staticmethod
+    def _render_md(text: str, font_family: str, font_scale: int) -> tuple:
+        """返回 (html, img_map)，img_map = {src_key: abs_path}"""
+        import re
+        from PySide6.QtGui import QFont
 
         base_px = 14.0 * font_scale / 100.0
         family = font_family if font_family else ("PingFang SC" if sys.platform == "darwin" else "Microsoft YaHei UI")
         font = QFont(family)
         font.setPixelSize(int(base_px))
-        doc.setDefaultFont(font)
 
+        # 收集图片路径，生成唯一 src key
+        img_map = {}  # src_key → abs_path
+        img_counter = [0]
+
+        def _resolve_md_img(m):
+            alt, src = m.group(1), m.group(2)
+            if src.startswith(("http://", "https://", "data:")):
+                return m.group(0)
+            # file:/// 绝对路径：提取本地路径
+            if src.startswith("file:///"):
+                local = src[8:]
+                if os.path.isfile(local):
+                    key = f"img_{img_counter[0]}"
+                    img_counter[0] += 1
+                    img_map[key] = local
+                    return f"![{alt}]({key})"
+                return m.group(0)
+            # 相对路径：搜索 frames/ 和 key_frames/
+            abs_path = MessageBubble._find_image(src)
+            if abs_path:
+                key = f"img_{img_counter[0]}"
+                img_counter[0] += 1
+                img_map[key] = abs_path
+                return f"![{alt}]({key})"
+            return m.group(0)
+
+        text = re.sub(r"!\[([^\]]*)\]\(([^)]+)\)", _resolve_md_img, text)
+
+        doc = QTextDocument()
+        doc.setDefaultFont(font)
         doc.setMarkdown(text)
         html = doc.toHtml()
 
@@ -70,22 +188,80 @@ class MessageBubble(QLabel):
         _patch('h3', 14, 4)
         _patch('p',  4,  4)
         _patch('li', 2,  2)
-        return html
+
+        # 把连续的 <p><img/></p> 合并为横向可点击的图片行
+        html = MessageBubble._group_consecutive_images(html, img_map)
+        return html, img_map
+
+    @staticmethod
+    def _group_consecutive_images(html: str, img_map: dict) -> str:
+        import re
+        img_p = re.compile(r'<p\s[^>]*>(?:\s*<img\s[^>]*>\s*)+</p>')
+
+        last_end = 0
+        chunks = []
+        for m in img_p.finditer(html):
+            if m.start() > last_end:
+                chunks.append(('text', html[last_end:m.start()]))
+            srcs = re.findall(r'<img\s[^>]*?src="([^"]*)"', m.group(0))
+            chunks.append(('imgs', srcs))
+            last_end = m.end()
+        if last_end < len(html):
+            chunks.append(('text', html[last_end:]))
+
+        result_parts = []
+        img_buf = []
+        for typ, content in chunks:
+            if typ == 'imgs':
+                img_buf.extend(content)
+            else:
+                if not content.strip() and img_buf:
+                    continue
+                if img_buf:
+                    result_parts.append(MessageBubble._make_img_row(img_buf, img_map))
+                    img_buf = []
+                result_parts.append(content)
+        if img_buf:
+            result_parts.append(MessageBubble._make_img_row(img_buf, img_map))
+        return ''.join(result_parts)
+
+    @staticmethod
+    def _make_img_row(srcs: list, img_map: dict) -> str:
+        items = []
+        for src in srcs:
+            abs_path = img_map.get(src, "")
+            if abs_path:
+                href = "imgview:///" + abs_path.replace(os.sep, "/")
+            else:
+                href = src
+            items.append(
+                f'<a href="{href}">'
+                f'<img src="{src}" width="200" />'
+                f'</a> '
+            )
+        return '<p style="margin-top:4px; margin-bottom:4px;">' + ''.join(items) + '</p>'
 
     def _apply_font(self):
-        self.setText(self._render_md(self._raw_text, self._font_family, self._font_scale))
+        html, img_map = self._render_md(self._raw_text, self._font_family, self._font_scale)
+        self._preload_images(img_map)
+        self.setHtml(html)
         self._sync_widget_font()
 
     def _sync_widget_font(self):
-        """确保 QLabel 基线字体与渲染时一致，使 HTML 相对字号正确解析"""
         base_px = 14.0 * self._font_scale / 100.0
-        family = f'"{self._font_family}"' if self._font_family else "inherit"
-        self.setStyleSheet(f"font-family: {family}; font-size: {base_px}px;")
+        family = self._font_family if self._font_family else ("PingFang SC" if sys.platform == "darwin" else "Microsoft YaHei UI")
+        font = QFont(family)
+        font.setPixelSize(int(base_px))
+        self.document().setDefaultFont(font)
 
     @classmethod
     def set_chat_font(cls, family: str, scale: int):
         cls._font_family = family
         cls._font_scale = scale
+
+    @classmethod
+    def set_base_dir(cls, base_dir: str):
+        cls._base_dir = base_dir
 
 
 class _ChatWorker(QThread):
@@ -107,7 +283,7 @@ class _ChatWorker(QThread):
 
 
 class _SessionConfigDialog(QDialog):
-    """对话配置：3 个文件路径"""
+    """对话配置：笔记 + 数据文件"""
 
     def __init__(self, session: ChatSession, parent=None):
         super().__init__(parent)
@@ -134,33 +310,21 @@ class _SessionConfigDialog(QDialog):
         btn_notes.clicked.connect(lambda: self._browse(self.notes_edit, "笔记文件", "Markdown (*.md);;所有文件 (*)"))
         grid.addWidget(btn_notes, 0, 2)
 
-        # Slides
-        grid.addWidget(QLabel("幻灯片 (slides.json):"), 1, 0)
-        self.slides_edit = QLineEdit()
-        self.slides_edit.setPlaceholderText("选择幻灯片文件...")
-        self.slides_edit.setText(session.slides_path)
-        grid.addWidget(self.slides_edit, 1, 1)
-        btn_slides = QPushButton("浏览")
-        btn_slides.setProperty("class", "secondary")
-        btn_slides.setFixedWidth(56)
-        btn_slides.clicked.connect(lambda: self._browse(self.slides_edit, "幻灯片文件", "JSON (*.json)"))
-        grid.addWidget(btn_slides, 1, 2)
-
-        # Transcript
-        grid.addWidget(QLabel("转录 (transcript.json):"), 2, 0)
-        self.transcript_edit = QLineEdit()
-        self.transcript_edit.setPlaceholderText("选择转录文件...")
-        self.transcript_edit.setText(session.transcript_path)
-        grid.addWidget(self.transcript_edit, 2, 1)
-        btn_trans = QPushButton("浏览")
-        btn_trans.setProperty("class", "secondary")
-        btn_trans.setFixedWidth(56)
-        btn_trans.clicked.connect(lambda: self._browse(self.transcript_edit, "转录文件", "JSON (*.json)"))
-        grid.addWidget(btn_trans, 2, 2)
+        # Data JSON (统一 JSON 或 slides.json)
+        grid.addWidget(QLabel("数据文件 (JSON):"), 1, 0)
+        self.data_edit = QLineEdit()
+        self.data_edit.setPlaceholderText("统一 JSON 或 slides.json...")
+        self.data_edit.setText(session.slides_path)
+        grid.addWidget(self.data_edit, 1, 1)
+        btn_data = QPushButton("浏览")
+        btn_data.setProperty("class", "secondary")
+        btn_data.setFixedWidth(56)
+        btn_data.clicked.connect(lambda: self._browse(self.data_edit, "数据文件", "JSON (*.json)"))
+        grid.addWidget(btn_data, 1, 2)
 
         layout.addLayout(grid)
 
-        hint = QLabel("文件路径可以为空，有笔记时笔记内容将作为对话首条消息显示。")
+        hint = QLabel("数据文件可包含幻灯片和转录内容。有笔记时笔记将作为对话首条消息显示。")
         hint.setProperty("class", "hint")
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -178,8 +342,7 @@ class _SessionConfigDialog(QDialog):
     def get_paths(self) -> tuple:
         return (
             self.notes_edit.text().strip(),
-            self.slides_edit.text().strip(),
-            self.transcript_edit.text().strip(),
+            self.data_edit.text().strip(),
         )
 
 
@@ -220,8 +383,15 @@ class ChatWidget(QWidget):
         top_layout.addWidget(title)
         top_layout.addStretch()
 
+        self.btn_new_folder = QPushButton("📁")
+        self.btn_new_folder.setFixedSize(28, 28)
+        self.btn_new_folder.setProperty("class", "secondary")
+        self.btn_new_folder.setToolTip("新建文件夹")
+        self.btn_new_folder.clicked.connect(self._on_new_folder)
+        top_layout.addWidget(self.btn_new_folder)
+
         self.btn_new_chat = QPushButton("＋")
-        self.btn_new_chat.setFixedSize(32, 28)
+        self.btn_new_chat.setFixedSize(28, 28)
         self.btn_new_chat.setProperty("class", "secondary")
         self.btn_new_chat.setToolTip("新建对话")
         self.btn_new_chat.clicked.connect(self._on_new_chat)
@@ -235,12 +405,18 @@ class ChatWidget(QWidget):
         sep.setFixedHeight(1)
         left_layout.addWidget(sep)
 
-        self.project_list = QListWidget()
-        self.project_list.setProperty("class", "project-list")
-        self.project_list.currentRowChanged.connect(self._on_session_selected)
-        self.project_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.project_list.customContextMenuRequested.connect(self._on_session_context_menu)
-        left_layout.addWidget(self.project_list, 1)
+        self.session_tree = QTreeWidget()
+        self.session_tree.setProperty("class", "session-tree")
+        self.session_tree.setHeaderHidden(True)
+        self.session_tree.setIndentation(16)
+        self.session_tree.setAnimated(True)
+        self.session_tree.setSelectionMode(
+            QTreeWidget.SelectionMode.ExtendedSelection
+        )
+        self.session_tree.currentItemChanged.connect(self._on_tree_item_changed)
+        self.session_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.session_tree.customContextMenuRequested.connect(self._on_tree_context_menu)
+        left_layout.addWidget(self.session_tree, 1)
 
         # ─── 右侧：聊天区 ───
         right_panel = QWidget()
@@ -314,6 +490,7 @@ class ChatWidget(QWidget):
         self.input_edit.setPlaceholderText("输入你的问题...")
         self.input_edit.setFixedHeight(72)
         self.input_edit.setMaximumHeight(100)
+        self.input_edit.installEventFilter(self)
         input_layout.addWidget(self.input_edit)
 
         bottom_row = QHBoxLayout()
@@ -394,29 +571,73 @@ class ChatWidget(QWidget):
 
     def refresh_session_list(self, provider_config: dict):
         self._provider_config = provider_config
-        self.project_list.clear()
+        self._build_session_tree()
 
+    def _build_session_tree(self):
+        """重建侧边栏树：文件夹 → 对话"""
+        self.session_tree.clear()
+        from src.chat import load_folders
+        folders = load_folders()
         sessions = list_sessions()
+
+        # 按 folder_id 分组
+        grouped: dict[str, list] = {}
+        ungrouped: list = []
         for s in sessions:
-            rounds_str = f" ({s['rounds']}轮)" if s["rounds"] > 0 else ""
-            label = f"{s['name']}{rounds_str}"
-            item = QListWidgetItem(label)
-            item.setData(Qt.ItemDataRole.UserRole, s)
-            self.project_list.addItem(item)
+            fid = s.get("folder_id", "")
+            if fid:
+                grouped.setdefault(fid, []).append(s)
+            else:
+                ungrouped.append(s)
 
-    def _on_session_selected(self, row: int):
-        if row < 0:
-            return
-        item = self.project_list.item(row)
-        info = item.data(Qt.ItemDataRole.UserRole)
-        if not info:
-            return
+        # 创建文件夹节点
+        for f in folders:
+            fid = f["id"]
+            folder_item = QTreeWidgetItem(self.session_tree, [f["name"]])
+            folder_item.setData(0, Qt.ItemDataRole.UserRole, {"type": "folder", "folder_id": fid})
+            folder_item.setExpanded(True)
+            font = folder_item.font(0)
+            font.setBold(True)
+            folder_item.setFont(0, font)
+            for s in grouped.get(fid, []):
+                self._add_session_item(folder_item, s)
 
+        # 未分组
+        if ungrouped or not folders:
+            ungrouped_item = QTreeWidgetItem(self.session_tree, ["未分组"])
+            ungrouped_item.setData(0, Qt.ItemDataRole.UserRole, {"type": "folder", "folder_id": ""})
+            ungrouped_item.setExpanded(True)
+            font = ungrouped_item.font(0)
+            font.setBold(True)
+            ungrouped_item.setFont(0, font)
+            for s in ungrouped:
+                self._add_session_item(ungrouped_item, s)
+
+    def _add_session_item(self, parent: QTreeWidgetItem, s: dict):
+        rounds_str = f" ({s['rounds']}轮)" if s["rounds"] > 0 else ""
+        label = f"{s['name']}{rounds_str}"
+        item = QTreeWidgetItem(parent, [label])
+        item.setData(0, Qt.ItemDataRole.UserRole, {"type": "session", **s})
+
+    def _on_tree_item_changed(self, current: QTreeWidgetItem, _prev):
+        if not current:
+            return
+        data = current.data(0, Qt.ItemDataRole.UserRole)
+        if not data or data.get("type") != "session":
+            return
+        info = data
         session_dir = info["session_dir"]
         self.session = ChatSession(session_dir, self._provider_config)
         self.session._load_history()
 
-        # 更新状态
+        # 推导项目目录作为图片解析的 base_dir
+        base_dir = ""
+        if self.session.notes_path and os.path.exists(self.session.notes_path):
+            base_dir = str(Path(self.session.notes_path).parent.parent)
+        elif self.session.slides_path and os.path.exists(self.session.slides_path):
+            base_dir = str(Path(self.session.slides_path).parent)
+        MessageBubble.set_base_dir(base_dir)
+
         n_msgs = sum(1 for m in self.session.messages if m.get("role") == "user")
         self.status_label.setText(f"{self.session.name} | {self.session.model} | {n_msgs} 轮")
         self._update_files_label()
@@ -430,40 +651,133 @@ class ChatWidget(QWidget):
             else:
                 parts.append("notes ✗")
             if self.session.slides_path and os.path.exists(self.session.slides_path):
-                parts.append("slides ✓")
+                parts.append("数据 ✓")
             else:
-                parts.append("slides ✗")
-            if self.session.transcript_path and os.path.exists(self.session.transcript_path):
-                parts.append("transcript ✓")
-            else:
-                parts.append("transcript ✗")
+                parts.append("数据 ✗")
         self.files_label.setText("  |  ".join(parts))
 
-    def _on_session_context_menu(self, pos):
-        item = self.project_list.itemAt(pos)
-        if not item:
-            return
-        info = item.data(Qt.ItemDataRole.UserRole)
-        session_dir = info.get("session_dir", "")
-        hfile = os.path.join(session_dir, "chat_history.json")
-
+    def _on_tree_context_menu(self, pos):
+        item = self.session_tree.itemAt(pos)
         menu = QMenu(self)
-        if os.path.isfile(hfile):
-            del_action = menu.addAction("删除此对话")
-        else:
+
+        if not item:
+            # 空白处：新建文件夹
+            menu.addAction("新建文件夹", self._on_new_folder)
+            menu.exec(self.session_tree.mapToGlobal(pos))
             return
 
-        action = menu.exec(self.project_list.mapToGlobal(pos))
-        if action == del_action:
+        data = item.data(0, Qt.ItemDataRole.UserRole)
+
+        if data.get("type") == "folder":
+            folder_id = data.get("folder_id", "")
+            if folder_id:  # 非默认"未分组"
+                menu.addAction("重命名", lambda: self._rename_folder(folder_id, item))
+                menu.addAction("删除文件夹", lambda: self._delete_folder(folder_id))
+            else:
+                menu.addAction("新建文件夹", self._on_new_folder)
+            menu.exec(self.session_tree.mapToGlobal(pos))
+            return
+
+        # Session 项（支持多选）
+        selected = self.session_tree.selectedItems()
+        session_items = [si for si in selected
+                         if si.data(0, Qt.ItemDataRole.UserRole).get("type") == "session"]
+
+        if not session_items:
+            return
+
+        # 移动到子菜单
+        from src.chat import load_folders
+        folders = load_folders()
+        if folders:
+            move_menu = menu.addMenu("移动到")
+            for f in folders:
+                move_menu.addAction(f["name"],
+                                    lambda checked=False, fid=f["id"]: self._move_to_folder(session_items, fid))
+            move_menu.addAction("未分组",
+                                lambda checked=False: self._move_to_folder(session_items, ""))
+
+        # 批量删除
+        n = len(session_items)
+        label = f"删除选中的 {n} 个对话" if n > 1 else "删除此对话"
+        menu.addAction(label, lambda: self._delete_sessions(session_items))
+
+        menu.exec(self.session_tree.mapToGlobal(pos))
+
+    def _on_new_folder(self):
+        name, ok = QInputDialog.getText(self, "新建文件夹", "文件夹名称：")
+        if not ok or not name.strip():
+            return
+        from src.chat import load_folders, save_folders
+        folders = load_folders()
+        fid = f"f{len(folders) + 1}_{int(datetime.now().timestamp())}"
+        folders.append({"id": fid, "name": name.strip(), "order": len(folders)})
+        save_folders(folders)
+        self._build_session_tree()
+
+    def _rename_folder(self, folder_id: str, item: QTreeWidgetItem):
+        old_name = item.text(0)
+        name, ok = QInputDialog.getText(self, "重命名文件夹", "新名称：", text=old_name)
+        if not ok or not name.strip():
+            return
+        from src.chat import load_folders, save_folders
+        folders = load_folders()
+        for f in folders:
+            if f["id"] == folder_id:
+                f["name"] = name.strip()
+                break
+        save_folders(folders)
+        self._build_session_tree()
+
+    def _delete_folder(self, folder_id: str):
+        """删除文件夹，对话移回未分组"""
+        from src.chat import load_folders, save_folders
+        folders = load_folders()
+        folders = [f for f in folders if f["id"] != folder_id]
+        save_folders(folders)
+        # 将该文件夹下所有 session 的 folder_id 清空
+        sessions = list_sessions()
+        for s in sessions:
+            if s.get("folder_id") == folder_id:
+                sdir = s["session_dir"]
+                hfile = os.path.join(sdir, "chat_history.json")
+                try:
+                    d = json.loads(Path(hfile).read_text(encoding="utf-8"))
+                    d["folder_id"] = ""
+                    Path(hfile).write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
+                except Exception:
+                    pass
+        self._build_session_tree()
+
+    def _move_to_folder(self, items: list, folder_id: str):
+        for item in items:
+            data = item.data(0, Qt.ItemDataRole.UserRole)
+            if data.get("type") != "session":
+                continue
+            sdir = data["session_dir"]
+            hfile = os.path.join(sdir, "chat_history.json")
+            try:
+                d = json.loads(Path(hfile).read_text(encoding="utf-8"))
+                d["folder_id"] = folder_id
+                Path(hfile).write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
+            except Exception:
+                pass
+        self._build_session_tree()
+
+    def _delete_sessions(self, items: list):
+        import shutil
+        for item in items:
+            data = item.data(0, Qt.ItemDataRole.UserRole)
+            if data.get("type") != "session":
+                continue
+            session_dir = data["session_dir"]
             if self.session and self.session.session_dir == session_dir:
                 self.session = None
                 self._clear_messages()
                 self.status_label.setText("选择或新建一个对话")
                 self.files_label.setText("")
-            import shutil
             shutil.rmtree(session_dir, ignore_errors=True)
-            row = self.project_list.row(item)
-            self.project_list.takeItem(row)
+        self._build_session_tree()
 
     # ─── 新建对话 ───
 
@@ -471,18 +785,34 @@ class ChatWidget(QWidget):
         session = create_empty_session(self._provider_config)
         self.session = session
 
-        # 刷新列表并选中新 session
-        self.refresh_session_list(self._provider_config)
-        for i in range(self.project_list.count()):
-            item = self.project_list.item(i)
-            info = item.data(Qt.ItemDataRole.UserRole)
-            if info and info["session_dir"] == session.session_dir:
-                self.project_list.setCurrentRow(i)
-                break
+        self._build_session_tree()
+        self._select_session_in_tree(session.session_dir)
 
         self.status_label.setText(f"{session.name} | 点击 ⚙ 配置文件")
-        self.files_label.setText("notes ✗  |  slides ✗  |  transcript ✗")
+        self.files_label.setText("notes ✗  |  数据 ✗")
         self._clear_messages()
+
+    def _select_session_in_tree(self, session_dir: str):
+        """在树中选中指定 session"""
+        it = QTreeWidgetItemIterator(self.session_tree)
+        while it.value():
+            item = it.value()
+            data = item.data(0, Qt.ItemDataRole.UserRole)
+            if data and data.get("type") == "session" and data.get("session_dir") == session_dir:
+                self.session_tree.setCurrentItem(item)
+                return
+            it.__next__()
+
+    def _select_first_session(self):
+        """选中树中第一个 session"""
+        it = QTreeWidgetItemIterator(self.session_tree)
+        while it.value():
+            item = it.value()
+            data = item.data(0, Qt.ItemDataRole.UserRole)
+            if data and data.get("type") == "session":
+                self.session_tree.setCurrentItem(item)
+                return
+            it.__next__()
 
     # ─── 齿轮配置 ───
 
@@ -495,8 +825,8 @@ class ChatWidget(QWidget):
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
 
-        notes_path, slides_path, transcript_path = dlg.get_paths()
-        self.session.update_files(notes_path, slides_path, transcript_path)
+        notes_path, data_path = dlg.get_paths()
+        self.session.update_files(notes_path, data_path)
 
         # 刷新 UI
         self._update_files_label()
@@ -507,24 +837,21 @@ class ChatWidget(QWidget):
         self.status_label.setText(f"{self.session.name} | {self.session.model} | {n_msgs} 轮")
 
     def _refresh_session_name(self):
-        row = self.project_list.currentRow()
-        if row < 0:
+        item = self.session_tree.currentItem()
+        if not item:
             return
-        item = self.project_list.item(row)
-        info = item.data(Qt.ItemDataRole.UserRole)
-        if not info:
+        data = item.data(0, Qt.ItemDataRole.UserRole)
+        if not data or data.get("type") != "session":
             return
         rounds = sum(1 for m in self.session.messages if m.get("role") == "user") if self.session else 0
-        name = self.session.name if self.session else info.get("name", "")
+        name = self.session.name if self.session else data.get("name", "")
         label = f"{name} ({rounds}轮)" if rounds > 0 else name
-        item.setText(label)
-        # 更新 data
-        info["name"] = name
+        item.setText(0, label)
+        data["name"] = name
         if self.session:
-            info["notes_path"] = self.session.notes_path
-            info["slides_path"] = self.session.slides_path
-            info["transcript_path"] = self.session.transcript_path
-        item.setData(Qt.ItemDataRole.UserRole, info)
+            data["notes_path"] = self.session.notes_path
+            data["slides_path"] = self.session.slides_path
+        item.setData(0, Qt.ItemDataRole.UserRole, data)
 
     # ─── 外部接口（Step 5 跳转） ───
 
@@ -542,13 +869,8 @@ class ChatWidget(QWidget):
         )
         self.session = session
 
-        self.refresh_session_list(provider_config)
-        for i in range(self.project_list.count()):
-            item = self.project_list.item(i)
-            info = item.data(Qt.ItemDataRole.UserRole)
-            if info and info["session_dir"] == session.session_dir:
-                self.project_list.setCurrentRow(i)
-                break
+        self._build_session_tree()
+        self._select_session_in_tree(session.session_dir)
 
     # ─── 消息 ───
 
@@ -558,6 +880,15 @@ class ChatWidget(QWidget):
             return
         for msg in self.session.messages:
             self._add_bubble(msg["role"], msg["content"])
+
+    def eventFilter(self, obj, event):
+        if obj is self.input_edit and event.type() == event.Type.KeyPress:
+            key = event.key()
+            mod = event.modifiers()
+            if key == Qt.Key.Key_Return and not (mod & Qt.KeyboardModifier.ShiftModifier or mod & Qt.KeyboardModifier.ControlModifier):
+                self._on_send()
+                return True
+        return super().eventFilter(obj, event)
 
     def _on_send(self):
         if not self.session:
@@ -572,6 +903,7 @@ class ChatWidget(QWidget):
         self.send_btn.setEnabled(False)
         self.input_edit.setEnabled(False)
         self.model_combo.setEnabled(False)
+        self.session_tree.setEnabled(False)
 
         self._thinking_bubble = MessageBubble("assistant", "")
         self._insert_widget(self._thinking_bubble)
@@ -612,6 +944,7 @@ class ChatWidget(QWidget):
         self.send_btn.setEnabled(True)
         self.input_edit.setEnabled(True)
         self.model_combo.setEnabled(True)
+        self.session_tree.setEnabled(True)
         self.input_edit.setFocus()
 
         import time
@@ -629,19 +962,19 @@ class ChatWidget(QWidget):
         self.send_btn.setEnabled(True)
         self.input_edit.setEnabled(True)
         self.model_combo.setEnabled(True)
+        self.session_tree.setEnabled(True)
         self.status_label.setText(f"请求失败: {err[:60]}")
 
     def _update_current_item_rounds(self, rounds: int):
-        row = self.project_list.currentRow()
-        if row < 0:
+        item = self.session_tree.currentItem()
+        if not item:
             return
-        item = self.project_list.item(row)
-        info = item.data(Qt.ItemDataRole.UserRole)
-        if not info:
+        data = item.data(0, Qt.ItemDataRole.UserRole)
+        if not data or data.get("type") != "session":
             return
-        base = info.get("name", "")
+        base = data.get("name", "")
         label = f"{base} ({rounds}轮)" if rounds > 0 else base
-        item.setText(label)
+        item.setText(0, label)
 
     # ─── UI 工具 ───
 

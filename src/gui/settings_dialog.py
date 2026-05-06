@@ -190,6 +190,19 @@ class SettingsDialog(QDialog):
         btn_add.clicked.connect(self._add_vision_card)
         self._vision_tab_layout.addWidget(btn_add)
 
+        # 并发设置
+        conc_row = QHBoxLayout()
+        conc_row.addWidget(QLabel("并发数:"))
+        self.vision_concurrent_spin = QSpinBox()
+        self.vision_concurrent_spin.setRange(1, 16)
+        self.vision_concurrent_spin.setToolTip("云端 API 可设 4-8，本地 Ollama 建议 1-2")
+        conc_row.addWidget(self.vision_concurrent_spin)
+        conc_hint = QLabel("云端可 4-8，本地建议 1-2")
+        conc_hint.setProperty("class", "hint")
+        conc_row.addWidget(conc_hint)
+        conc_row.addStretch()
+        self._vision_tab_layout.addLayout(conc_row)
+
         # Prompt
         pg = QGroupBox("图片分析 Prompt")
         pl = QVBoxLayout(pg)
@@ -752,6 +765,7 @@ class SettingsDialog(QDialog):
         # 图片识别
         self._vision_data = [dict(v) for v in s.vision_models]
         self._rebuild_vision_cards()
+        self.vision_concurrent_spin.setValue(s.vision_concurrent)
         self.vision_ocr_edit.setPlainText(s.vision_prompt_ocr)
         self.vision_diagram_edit.setPlainText(s.vision_prompt_diagram)
         self.vision_title_edit.setPlainText(s.vision_prompt_title)
@@ -801,6 +815,7 @@ class SettingsDialog(QDialog):
         s.vision_models = [{k: v for k, v in d.items() if k != "_widgets"} for d in self._vision_data]
         if s.vision_models:
             s.vision_active = s.vision_models[0].get("name", "")
+        s.vision_concurrent = self.vision_concurrent_spin.value()
         s.vision_prompt_ocr = self.vision_ocr_edit.toPlainText()
         s.vision_prompt_diagram = self.vision_diagram_edit.toPlainText()
         s.vision_prompt_title = self.vision_title_edit.toPlainText()

@@ -93,6 +93,7 @@ class Settings:
         {"name": "OpenAI", "base_url": "https://api.openai.com/v1", "api_key": "", "model": "whisper-1", "api_type": "whisper"},
     ])
     ollama_url: str = "http://localhost:11434"
+    vision_concurrent: int = 1  # 图片理解并发数（云端可 4-8，本地建议 1-2）
     vision_active: str = "minicpm-v 本地"  # 当前激活的视觉模型名称
     vision_models: list = field(default_factory=lambda: [
         {"name": "minicpm-v 本地", "type": "ollama", "model": "minicpm-v:8b", "url": "http://localhost:11434", "api_key": "", "prompt_strategy": "triple"},

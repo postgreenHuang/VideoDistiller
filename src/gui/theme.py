@@ -491,25 +491,26 @@ def build_stylesheet(theme_name: str) -> str:
         letter-spacing: 0.5px;
         border: none;
     }}
-    QListWidget[class="project-list"] {{
+    QTreeWidget[class="session-tree"] {{
         background: {c['surface']};
         border: none;
         outline: none;
         padding: 4px 8px;
     }}
-    QListWidget[class="project-list"]::item {{
-        padding: 10px 12px;
-        border-radius: 6px;
-        color: {c['text']};
-        font-size: 13px;
+    QTreeWidget[class="session-tree"]::item {{
+        padding: 6px 4px;
+        border-radius: 4px;
         border: none;
     }}
-    QListWidget[class="project-list"]::item:selected {{
+    QTreeWidget[class="session-tree"]::item:selected {{
         background: {c['accent']};
         color: #ffffff;
     }}
-    QListWidget[class="project-list"]::item:hover:!selected {{
+    QTreeWidget[class="session-tree"]::item:hover:!selected {{
         background: {c['btn_secondary']};
+    }}
+    QTreeWidget[class="session-tree"]::branch {{
+        background: transparent;
     }}
 
     /* ─── Chat 模型选择 ─── */
@@ -538,7 +539,7 @@ def build_stylesheet(theme_name: str) -> str:
     }}
 
     /* ─── Chat 消息气泡 ─── */
-    QLabel[class="msg-user"] {{
+    QTextBrowser[class="msg-user"] {{
         background: {c['accent']};
         color: #e8e8ee;
         border: none;
@@ -546,7 +547,7 @@ def build_stylesheet(theme_name: str) -> str:
         padding: 12px 18px;
         margin-left: 36px;
     }}
-    QLabel[class="msg-assistant"] {{
+    QTextBrowser[class="msg-assistant"] {{
         background: {c['surface']};
         color: {c['text']};
         border: none;

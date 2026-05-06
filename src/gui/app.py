@@ -257,10 +257,17 @@ class MainWindow(QMainWindow):
 
         right.addLayout(model_grid)
 
-        # 开始按钮
+        # 开始按钮 + 重试按钮
+        btn_row = QHBoxLayout()
         self.btn_batch_start = QPushButton("开始批量蒸馏")
         self.btn_batch_start.clicked.connect(self._batch_start)
-        right.addWidget(self.btn_batch_start)
+        btn_row.addWidget(self.btn_batch_start)
+        self.btn_batch_retry = QPushButton("重试失败")
+        self.btn_batch_retry.setProperty("class", "secondary")
+        self.btn_batch_retry.clicked.connect(self._batch_retry)
+        self.btn_batch_retry.setVisible(False)
+        btn_row.addWidget(self.btn_batch_retry)
+        right.addLayout(btn_row)
 
         # 进度
         self.batch_progress = QProgressBar()
@@ -356,6 +363,35 @@ class MainWindow(QMainWindow):
         if path:
             self.batch_output_edit.setText(path)
 
+    def _batch_retry(self):
+        """重试上次失败的视频，自动跳过已完成步骤"""
+        failed = getattr(self, "_pending_retry_videos", [])
+        if not failed:
+            return
+        self.btn_batch_retry.setVisible(False)
+        self.batch_progress.setValue(0)
+        self.batch_log.append(f"\n── 重试 {len(failed)} 个失败视频 ──\n")
+
+        # 复用当前模型配置
+        asr_data = self.batch_asr_combo.currentData()
+        select_data = self.batch_select_combo.currentData()
+        vision_data = self.batch_vision_combo.currentData()
+        agg_data = self.batch_agg_combo.currentData()
+
+        self.btn_batch_start.setText("停止")
+        self.btn_batch_start.clicked.disconnect()
+        self.btn_batch_start.clicked.connect(self._batch_stop)
+
+        self._batch_worker = _BatchWorker(
+            failed, self.batch_output_edit.text().strip(), self.settings,
+            asr_data, select_data, vision_data, agg_data,
+        )
+        self._batch_worker.progress.connect(lambda v: self.batch_progress.setValue(int(v * 100)))
+        self._batch_worker.video_progress.connect(self._batch_on_video_progress)
+        self._batch_worker.log.connect(self._batch_on_log)
+        self._batch_worker.finished.connect(self._batch_on_done)
+        self._batch_worker.start()
+
     def _batch_start(self):
         if self.batch_video_list.count() == 0:
             self.batch_log.append("请先添加视频文件")
@@ -411,8 +447,15 @@ class MainWindow(QMainWindow):
         self.btn_batch_start.clicked.disconnect()
         self.btn_batch_start.clicked.connect(self._batch_start)
         self.batch_progress.setValue(100 if ok else self.batch_progress.value())
-        self.batch_log.append(f"\n{'全部完成' if ok else '已停止'}: {msg}")
+        failed_videos = self._batch_worker._failed_videos if self._batch_worker else []
         self._batch_worker = None
+        self.batch_log.append(f"\n{'全部完成' if ok else '已停止'}: {msg}")
+        if failed_videos:
+            self.btn_batch_retry.setText(f"重试失败 ({len(failed_videos)})")
+            self.btn_batch_retry.setVisible(True)
+            self._pending_retry_videos = failed_videos
+        else:
+            self.btn_batch_retry.setVisible(False)
 
     # ─── 顶部路径栏 ───
 
@@ -815,8 +858,7 @@ class MainWindow(QMainWindow):
                 break
         self.chat_widget.refresh_session_list(provider_config)
         # 选中最新的 session
-        if self.chat_widget.project_list.count() > 0:
-            self.chat_widget.project_list.setCurrentRow(0)
+        self.chat_widget._select_first_session()
 
     def _on_generate_error(self, err: str):
         self._gen_timer.stop()
@@ -1182,6 +1224,7 @@ class MainWindow(QMainWindow):
         self._vision_worker = _VisionWorker(
             str(key_frames_dir), str(project_dir), vision_config, prompts,
             transcript_segments, unified_json_path,
+            max_concurrent=self.settings.vision_concurrent,
         )
         self._vision_worker.progress.connect(
             lambda v: self.analysis_progress.setValue(int(v * 100))
@@ -1408,7 +1451,8 @@ class _VisionWorker(QThread):
     finished = Signal(bool, str)
 
     def __init__(self, key_frames_dir, output_dir, vision_config, prompts,
-                 transcript_segments=None, unified_json_path=""):
+                 transcript_segments=None, unified_json_path="",
+                 max_concurrent=1):
         super().__init__()
         self.key_frames_dir = key_frames_dir
         self.output_dir = output_dir
@@ -1418,6 +1462,7 @@ class _VisionWorker(QThread):
         self._cancel_flag = {"cancel": False}
         self.result = None
         self.unified_json_path = unified_json_path
+        self.max_concurrent = max_concurrent
 
     def cancel(self):
         self._cancel_flag["cancel"] = True
@@ -1432,6 +1477,7 @@ class _VisionWorker(QThread):
                 cancel_flag=self._cancel_flag,
                 token_cb=lambda d: self.token_update.emit(d),
                 transcript_segments=self.transcript_segments,
+                max_concurrent=self.max_concurrent,
                 unified_json_path=self.unified_json_path,
             )
             self.result = result
@@ -1547,6 +1593,7 @@ class _BatchWorker(QThread):
         self.vision_config = vision_config
         self.agg_provider = agg_provider
         self._cancel = False
+        self._failed_videos: list[str] = []
 
     def _step_progress_cb(self, step_weights, video_idx, total_videos, step_idx):
         """创建映射到整体进度的 progress_cb"""
@@ -1580,190 +1627,222 @@ class _BatchWorker(QThread):
             try:
                 project_dir = str(get_project_dir(self.output_dir, video_path))
 
+                # 检测已完成步骤，跳过
+                from src.pipeline import get_completed_steps
+                completed = get_completed_steps(project_dir)
+                start_step = 0
+                for si, ok in enumerate(completed):
+                    if not ok:
+                        start_step = si
+                        break
+                else:
+                    start_step = 5  # 全部完成
+
+                if start_step > 0:
+                    done_names = [f"Step {j+1}" for j in range(start_step) if completed[j]]
+                    self.log.emit(f"  跳过 {', '.join(done_names)} (已完成)，从 Step {start_step+1} 开始...")
+
+                if start_step >= 5:
+                    self.log.emit(f"  ✓ {name} 已全部完成，跳过\n")
+                    success += 1
+                    continue
+
                 # Step 1: 媒体提取
-                self.log.emit(f"  Step 1 媒体提取...")
-                audio_dir = os.path.join(project_dir, "audio")
-                extract_audio(
-                    video_path, audio_dir,
-                    sample_rate=s.sample_rate,
-                    progress_cb=self._step_progress_cb(step_weights, i, total, 0),
-                )
-                fps = 1.0 / s.frame_interval if s.frame_interval > 0 else 1.0
-                extract_frames(
-                    video_path, project_dir,
-                    fps=fps, resolution_scale=s.resolution_scale,
-                    progress_cb=self._step_progress_cb(step_weights, i, total, 0),
-                )
-                self.log.emit(f"  Step 1 完成")
+                if start_step <= 0:
+                    self.log.emit(f"  Step 1 媒体提取...")
+                    audio_dir = os.path.join(project_dir, "audio")
+                    extract_audio(
+                        video_path, audio_dir,
+                        sample_rate=s.sample_rate,
+                        progress_cb=self._step_progress_cb(step_weights, i, total, 0),
+                    )
+                    fps = 1.0 / s.frame_interval if s.frame_interval > 0 else 1.0
+                    extract_frames(
+                        video_path, project_dir,
+                        fps=fps, resolution_scale=s.resolution_scale,
+                        progress_cb=self._step_progress_cb(step_weights, i, total, 0),
+                    )
+                    self.log.emit(f"  Step 1 完成")
+                else:
+                    audio_dir = os.path.join(project_dir, "audio")
 
                 if self._cancel:
                     break
 
                 # Step 2: 语音转录
-                self.log.emit(f"  Step 2 语音转录...")
-                mp3_files = list(Path(audio_dir).glob("*.mp3"))
-                if not mp3_files:
-                    raise RuntimeError("未生成音频文件")
-                audio_path = str(mp3_files[0])
+                if start_step <= 1:
+                    self.log.emit(f"  Step 2 语音转录...")
+                    mp3_files = list(Path(audio_dir).glob("*.mp3"))
+                    if not mp3_files:
+                        raise RuntimeError("未生成音频文件")
+                    audio_path = str(mp3_files[0])
 
-                language = s.whisper_language if s.whisper_language else None
-                vocabulary = s.vocabularies[0]["terms"] if s.vocabularies else None
+                    language = s.whisper_language if s.whisper_language else None
+                    vocabulary = s.vocabularies[0]["terms"] if s.vocabularies else None
 
-                asr_type = "cloud" if self.asr_data and self.asr_data.get("type") != "local" else "local"
-                if asr_type == "cloud":
-                    model = self.asr_data["model"]
-                    asr_api_url = self.asr_data.get("base_url", "")
-                    asr_api_key = self.asr_data.get("api_key", "")
-                    asr_api_type = self.asr_data.get("api_type", "whisper")
-                else:
-                    model = self.asr_data.get("model", s.whisper_model) if self.asr_data else s.whisper_model
-                    asr_api_url = ""
-                    asr_api_key = ""
-                    asr_api_type = "whisper"
+                    asr_type = "cloud" if self.asr_data and self.asr_data.get("type") != "local" else "local"
+                    if asr_type == "cloud":
+                        model = self.asr_data["model"]
+                        asr_api_url = self.asr_data.get("base_url", "")
+                        asr_api_key = self.asr_data.get("api_key", "")
+                        asr_api_type = self.asr_data.get("api_type", "whisper")
+                    else:
+                        model = self.asr_data.get("model", s.whisper_model) if self.asr_data else s.whisper_model
+                        asr_api_url = ""
+                        asr_api_key = ""
+                        asr_api_type = "whisper"
 
-                transcribe(
-                    audio_path=audio_path,
-                    output_dir=project_dir,
-                    video_path=video_path,
-                    asr_type=asr_type,
-                    model=model,
-                    language=language,
-                    vocabulary=vocabulary,
-                    segment_length=s.segment_length,
-                    asr_api_url=asr_api_url,
-                    asr_api_key=asr_api_key,
-                    asr_cloud_model=model,
-                    asr_api_type=asr_api_type,
-                    progress_cb=self._step_progress_cb(step_weights, i, total, 1),
-                )
-                self.log.emit(f"  Step 2 完成")
+                    transcribe(
+                        audio_path=audio_path,
+                        output_dir=project_dir,
+                        video_path=video_path,
+                        asr_type=asr_type,
+                        model=model,
+                        language=language,
+                        vocabulary=vocabulary,
+                        segment_length=s.segment_length,
+                        asr_api_url=asr_api_url,
+                        asr_api_key=asr_api_key,
+                        asr_cloud_model=model,
+                        asr_api_type=asr_api_type,
+                        progress_cb=self._step_progress_cb(step_weights, i, total, 1),
+                    )
+                    self.log.emit(f"  Step 2 完成")
 
                 if self._cancel:
                     break
 
                 # Step 3: 智能选帧
-                self.log.emit(f"  Step 3 智能选帧...")
-                # 使用统一 JSON 路径，回退旧格式
-                unified_path = os.path.join(project_dir, f"{name}.json")
-                if os.path.exists(unified_path):
-                    transcript_path = unified_path
+                key_frames_dir = os.path.join(project_dir, "key_frames")
+                if start_step <= 2:
+                    self.log.emit(f"  Step 3 智能选帧...")
+                    unified_path = os.path.join(project_dir, f"{name}.json")
+                    if os.path.exists(unified_path):
+                        transcript_path = unified_path
+                    else:
+                        transcript_path = os.path.join(project_dir, "transcript", "transcript.json")
+                    frames_dir = os.path.join(project_dir, "frames")
+                    select_result = select_frames(
+                        transcript_path, frames_dir, project_dir,
+                        self.select_provider,
+                        progress_cb=self._step_progress_cb(step_weights, i, total, 2),
+                    )
+                    self.log.emit(f"  Step 3 选出 {select_result['selected']} 帧")
                 else:
-                    transcript_path = os.path.join(project_dir, "transcript", "transcript.json")
-                frames_dir = os.path.join(project_dir, "frames")
-                select_result = select_frames(
-                    transcript_path, frames_dir, project_dir,
-                    self.select_provider,
-                    progress_cb=self._step_progress_cb(step_weights, i, total, 2),
-                )
-                self.log.emit(f"  Step 3 选出 {select_result['selected']} 帧")
+                    # Step 3 已跳过，直接检查 key_frames 目录
+                    key_frame_count = len(list(Path(key_frames_dir).glob("*.jpg"))) if os.path.isdir(key_frames_dir) else 0
+                    select_result = {"selected": key_frame_count, "total": 0}
+                    # 也需要 transcript_path 供 Step 4 使用
+                    unified_path = os.path.join(project_dir, f"{name}.json")
+                    transcript_path = unified_path if os.path.exists(unified_path) else os.path.join(project_dir, "transcript", "transcript.json")
 
                 if self._cancel:
                     break
 
                 # Step 4: 图片理解（0 帧则跳过）
-                key_frames_dir = os.path.join(project_dir, "key_frames")
-                has_slides = select_result['selected'] > 0 and os.path.exists(key_frames_dir) and list(Path(key_frames_dir).glob("*.jpg"))
+                if start_step <= 3:
+                    has_slides = select_result['selected'] > 0 and os.path.exists(key_frames_dir) and list(Path(key_frames_dir).glob("*.jpg"))
 
-                if has_slides:
-                    self.log.emit(f"  Step 4 图片理解...")
-                    vision_cfg = dict(self.vision_config) if self.vision_config else {}
-                    if not vision_cfg.get("url"):
-                        vision_cfg["url"] = s.ollama_url
+                    if has_slides:
+                        self.log.emit(f"  Step 4 图片理解...")
+                        vision_cfg = dict(self.vision_config) if self.vision_config else {}
+                        if not vision_cfg.get("url"):
+                            vision_cfg["url"] = s.ollama_url
 
-                    transcript_segments = []
-                    try:
-                        with open(transcript_path, "r", encoding="utf-8") as f:
-                            tdata = json.load(f)
-                        transcript_segments = tdata.get("segments", [])
-                    except Exception:
-                        pass
+                        transcript_segments = []
+                        try:
+                            with open(transcript_path, "r", encoding="utf-8") as f:
+                                tdata = json.load(f)
+                            transcript_segments = tdata.get("segments", [])
+                        except Exception:
+                            pass
 
-                    prompts = {
-                        "ocr": s.vision_prompt_ocr,
-                        "diagram": s.vision_prompt_diagram,
-                        "title": s.vision_prompt_title,
-                        "single": s.vision_prompt_single,
-                    }
+                        prompts = {
+                            "ocr": s.vision_prompt_ocr,
+                            "diagram": s.vision_prompt_diagram,
+                            "title": s.vision_prompt_title,
+                            "single": s.vision_prompt_single,
+                        }
 
-                    # 使用统一 JSON 路径写入
-                    unified_json = os.path.join(project_dir, f"{name}.json")
-                    analyze_images(
-                        key_frames_dir, project_dir, vision_cfg, prompts,
-                        progress_cb=self._step_progress_cb(step_weights, i, total, 3),
-                        transcript_segments=transcript_segments,
-                        unified_json_path=unified_json,
-                    )
-                    self.log.emit(f"  Step 4 完成")
-                else:
-                    self.log.emit(f"  Step 4 跳过（无关键帧，仅使用转录）")
+                        unified_json = os.path.join(project_dir, f"{name}.json")
+                        analyze_images(
+                            key_frames_dir, project_dir, vision_cfg, prompts,
+                            progress_cb=self._step_progress_cb(step_weights, i, total, 3),
+                            transcript_segments=transcript_segments,
+                            unified_json_path=unified_json,
+                            max_concurrent=s.vision_concurrent,
+                        )
+                        self.log.emit(f"  Step 4 完成")
+                    else:
+                        self.log.emit(f"  Step 4 跳过（无关键帧，仅使用转录）")
 
                 if self._cancel:
                     break
 
                 # Step 5: AI 聚合
-                self.log.emit(f"  Step 5 AI 聚合...")
+                if start_step <= 4:
+                    self.log.emit(f"  Step 5 AI 聚合...")
 
-                slides_text = ""
-                transcript_text = ""
-                # 从统一 JSON 读取
-                unified_json = os.path.join(project_dir, f"{name}.json")
-                if os.path.exists(unified_json):
-                    udata = json.loads(Path(unified_json).read_text(encoding="utf-8"))
-                    slides = udata.get("slides", [])
-                    segments = udata.get("segments", [])
-                    if slides:
-                        slides_text = json.dumps(slides, ensure_ascii=False, indent=2)
-                    if segments:
-                        transcript_text = json.dumps(segments, ensure_ascii=False, indent=2)
+                    slides_text = ""
+                    transcript_text = ""
+                    unified_json = os.path.join(project_dir, f"{name}.json")
+                    if os.path.exists(unified_json):
+                        udata = json.loads(Path(unified_json).read_text(encoding="utf-8"))
+                        slides = udata.get("slides", [])
+                        segments = udata.get("segments", [])
+                        if slides:
+                            slides_text = json.dumps(slides, ensure_ascii=False, indent=2)
+                        if segments:
+                            transcript_text = json.dumps(segments, ensure_ascii=False, indent=2)
 
-                # 回退旧格式
-                if not slides_text:
-                    slides_path = os.path.join(project_dir, "slides.json")
-                    if os.path.exists(slides_path):
-                        slides_text = Path(slides_path).read_text(encoding="utf-8")
-                if not transcript_text:
-                    old_transcript = os.path.join(project_dir, "transcript", "transcript.json")
-                    if os.path.exists(old_transcript):
-                        transcript_text = Path(old_transcript).read_text(encoding="utf-8")
+                    if not slides_text:
+                        slides_path = os.path.join(project_dir, "slides.json")
+                        if os.path.exists(slides_path):
+                            slides_text = Path(slides_path).read_text(encoding="utf-8")
+                    if not transcript_text:
+                        old_transcript = os.path.join(project_dir, "transcript", "transcript.json")
+                        if os.path.exists(old_transcript):
+                            transcript_text = Path(old_transcript).read_text(encoding="utf-8")
 
-                prompt = s.default_distill_prompt
-                base_url = self.agg_provider.get("base_url", "").rstrip("/")
-                api_key = self.agg_provider.get("api_key", "")
-                agg_model = self.agg_provider.get("model", "")
+                    prompt = s.default_distill_prompt
+                    base_url = self.agg_provider.get("base_url", "").rstrip("/")
+                    api_key = self.agg_provider.get("api_key", "")
+                    agg_model = self.agg_provider.get("model", "")
 
-                url = base_url + "/chat/completions"
-                user_content = f"--- 幻灯片描述 ---\n{slides_text}\n\n--- 语音转录 ---\n{transcript_text}"
-                payload = {
-                    "model": agg_model,
-                    "messages": [
-                        {"role": "system", "content": prompt},
-                        {"role": "user", "content": user_content},
-                    ],
-                    "max_tokens": 4096,
-                }
-                headers = {
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {api_key}",
-                }
-                resp = requests.post(url, json=payload, headers=headers, timeout=300)
-                resp.raise_for_status()
-                notes_text = resp.json()["choices"][0]["message"]["content"].strip()
+                    url = base_url + "/chat/completions"
+                    user_content = f"--- 幻灯片描述 ---\n{slides_text}\n\n--- 语音转录 ---\n{transcript_text}"
+                    payload = {
+                        "model": agg_model,
+                        "messages": [
+                            {"role": "system", "content": prompt},
+                            {"role": "user", "content": user_content},
+                        ],
+                        "max_tokens": 4096,
+                    }
+                    headers = {
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {api_key}",
+                    }
+                    resp = requests.post(url, json=payload, headers=headers, timeout=300)
+                    resp.raise_for_status()
+                    notes_text = resp.json()["choices"][0]["message"]["content"].strip()
 
-                notes_dir = os.path.join(project_dir, "notes")
-                os.makedirs(notes_dir, exist_ok=True)
-                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                notes_path = os.path.join(notes_dir, f"{name}_{ts}.md")
-                Path(notes_path).write_text(notes_text, encoding="utf-8")
+                    notes_dir = os.path.join(project_dir, "notes")
+                    os.makedirs(notes_dir, exist_ok=True)
+                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    notes_path = os.path.join(notes_dir, f"{name}_{ts}.md")
+                    Path(notes_path).write_text(notes_text, encoding="utf-8")
 
-                from src.chat import create_session
-                create_session(project_dir, name, notes_path, self.agg_provider)
+                    from src.chat import create_session
+                    create_session(project_dir, name, notes_path, self.agg_provider)
 
-                self.log.emit(f"  ✓ {name} 笔记已生成\n")
+                    self.log.emit(f"  ✓ {name} 笔记已生成\n")
                 success += 1
 
             except Exception as e:
                 self.log.emit(f"  ✗ {name} 失败: {e}\n")
                 failed += 1
+                self._failed_videos.append(video_path)
 
             self.video_progress.emit(i + 1, total)
 
