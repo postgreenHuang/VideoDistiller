@@ -142,6 +142,13 @@ class MessageBubble(QTextBrowser):
         font = QFont(family)
         font.setPixelSize(int(base_px))
 
+        # 预处理：把 "XX_XX_frame.jpg (描述)" 转为 "![描述](XX_XX_frame.jpg)"
+        text = re.sub(
+            r'(\d{2}_\d{2}_frame\.(?:jpg|jpeg|png))\s*\(([^)]+)\)',
+            r'![\2](\1)',
+            text,
+        )
+
         # 收集图片路径，生成唯一 src key
         img_map = {}  # src_key → abs_path
         img_counter = [0]
