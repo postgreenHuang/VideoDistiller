@@ -1549,7 +1549,7 @@ class _GenerateWorker(QThread):
                     {"role": "system", "content": self.prompt},
                     {"role": "user", "content": user_content},
                 ],
-                "max_tokens": 4096,
+                "max_tokens": 100000,
             }
             headers = {
                 "Content-Type": "application/json",
@@ -1817,7 +1817,7 @@ class _BatchWorker(QThread):
                             {"role": "system", "content": prompt},
                             {"role": "user", "content": user_content},
                         ],
-                        "max_tokens": 4096,
+                        "max_tokens": 100000,
                     }
                     headers = {
                         "Content-Type": "application/json",
