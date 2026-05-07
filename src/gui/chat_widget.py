@@ -125,10 +125,15 @@ class MessageBubble(QTextBrowser):
         """在 base_dir 的 frames/ 和 key_frames/ 子目录中搜索图片，返回绝对路径或空串"""
         if not MessageBubble._base_dir:
             return ""
-        for subdir in ("frames", "key_frames", ""):
-            full = os.path.join(MessageBubble._base_dir, subdir, src) if subdir else os.path.join(MessageBubble._base_dir, src)
-            if os.path.isfile(full):
-                return full
+        # 尝试原始名 + 冒号→下划线规范化
+        candidates = [src]
+        if ":" in src:
+            candidates.append(src.replace(":", "_", 1))
+        for name in candidates:
+            for subdir in ("frames", "key_frames", ""):
+                full = os.path.join(MessageBubble._base_dir, subdir, name) if subdir else os.path.join(MessageBubble._base_dir, name)
+                if os.path.isfile(full):
+                    return full
         return ""
 
     @staticmethod
@@ -143,34 +148,39 @@ class MessageBubble(QTextBrowser):
         font.setPixelSize(int(base_px))
 
         # 预处理：统一各种非标准图片引用为标准 Markdown 格式
-        # 宽松文件名匹配：XX_XX 开头 + 可选 _frame + .jpg/.jpeg/.png
-        _IMG_RE = r'(\d{2}_\d{2}(?:_\w+)?\.(?:jpg|jpeg|png))'
+        # 时间戳格式：XX_XX 或 XX:XX，可选后缀，.jpg/.jpeg/.png
+        _TS = r'\d{1,2}[:_]\d{2}'
+        _IMG_RE = rf'({_TS}(?:_\w+)?\.(?:jpg|jpeg|png))'
 
-        # 格式1: "XX_XX_frame.jpg (描述)" → ![描述](XX_XX_frame.jpg)
+        def _normalize_colon(m):
+            """把 XX:XX_frame.jpg 规范化为 XX_XX_frame.jpg"""
+            return m.group(0).replace(":", "_", 1)
+
+        # 格式1: "XX_XX_frame.jpg (描述)" 或 "05:00_frame.jpg (描述)" → ![描述](XX_XX_frame.jpg)
         text = re.sub(
             _IMG_RE + r'\s*\(([^)]+)\)',
-            r'![\2](\1)',
+            lambda m: f'![{m.group(2)}]({_normalize_colon(m)})',
             text,
         )
 
         # 格式2: "XX_XX_frame.jpg: 描述" → ![描述](XX_XX_frame.jpg)
         text = re.sub(
             _IMG_RE + r':\s*(.+?)(?:\n|$)',
-            r'![\2](\1)\n',
+            lambda m: f'![{m.group(2).strip()}]({_normalize_colon(m)})\n',
             text,
         )
 
-        # 格式3: "[截图引用：a.jpg, b.jpg, c.jpg]" → 逐个展开为 ![截图](a.jpg)
-        def _expand_bracket_list(m):
+        # 格式3: "[截图引用：a.jpg, b.jpg]" 或 "截图引用： a.jpg" → 逐个展开
+        def _expand_img_list(m):
             content = m.group(1)
-            files = re.findall(r'\d{2}_\d{2}(?:_\w+)?\.(?:jpg|jpeg|png)', content)
-            return "\n".join(f"![截图]({f})" for f in files)
-        text = re.sub(r'\[截图引用[：:]\s*([^\]]+)\]', _expand_bracket_list, text)
+            files = re.findall(rf'{_TS}(?:_\w+)?\.(?:jpg|jpeg|png)', content)
+            return "\n".join(f"![截图]({f.replace(':', '_', 1)})" for f in files)
+        text = re.sub(r'(?:\[)?截图引用[：:]\s*([^\]]+?)(?:\])?(?:\n|$)', _expand_img_list, text)
 
-        # 格式4: 裸文件名单独一行 "XX_XX_frame.jpg" → ![截图](XX_XX_frame.jpg)
+        # 格式4: 裸文件名单独一行
         text = re.sub(
-            r'(?<!!\[)\b(\d{2}_\d{2}(?:_\w+)?\.(?:jpg|jpeg|png))\b(?!\))',
-            r'![截图](\1)',
+            rf'(?<!!\[)\b({_TS}(?:_\w+)?\.(?:jpg|jpeg|png))\b(?!\))',
+            lambda m: f'![截图]({_normalize_colon(m)})',
             text,
         )
 
