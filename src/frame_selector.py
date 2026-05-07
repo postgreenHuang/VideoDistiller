@@ -52,6 +52,30 @@ def _seconds_to_mmss(seconds: float) -> str:
     return f"{s // 60:02d}:{s % 60:02d}"
 
 
+def _ensure_renamed_frames(frames_dir: str):
+    """如果有残留的 _tmp_NNNNNN.jpg 未重命名，补一轮重命名"""
+    tmp_files = sorted(
+        f for f in os.listdir(frames_dir) if f.startswith("_tmp_") and f.endswith(".jpg")
+    )
+    if not tmp_files:
+        return
+    # 推断 fps：看已有重命名文件的数量推算，或用默认 1fps
+    renamed = [f for f in os.listdir(frames_dir) if re.match(r'\d{2}_\d{2}_frame\.jpg', f)]
+    if renamed:
+        return  # 已有重命名文件，_tmp_ 是多余的重复，跳过
+    fps = 1.0  # 默认 1fps
+    for idx, fname in enumerate(tmp_files):
+        seconds = idx / fps
+        m, s = int(seconds) // 60, int(seconds) % 60
+        new_name = f"{m:02d}_{s:02d}_frame.jpg"
+        src = os.path.join(frames_dir, fname)
+        dst = os.path.join(frames_dir, new_name)
+        if not os.path.exists(dst):
+            os.rename(src, dst)
+        else:
+            os.remove(src)
+
+
 def _build_available_frames_list(frames_dir: str) -> list[tuple[str, float]]:
     """返回 [(filename, seconds), ...] 按时间排序"""
     frames = []
@@ -173,7 +197,8 @@ def select_frames(
     if progress_cb:
         progress_cb(0.1)
 
-    # 2. 扫描可用帧
+    # 2. 扫描可用帧（先补一轮 _tmp_ → MM_SS_frame.jpg 重命名）
+    _ensure_renamed_frames(frames_dir)
     available = _build_available_frames_list(frames_dir)
     if not available:
         raise ValueError(f"帧目录为空: {frames_dir}")
