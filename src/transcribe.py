@@ -97,7 +97,7 @@ def _enrich_segments(segments: list[dict]) -> list[dict]:
 
 # ─── 本地 faster-whisper（子进程隔离 CUDA） ───
 
-_LOCAL_CHUNK_SECONDS = 600  # 10 分钟一个切片
+_LOCAL_CHUNK_SECONDS = 180  # 3 分钟一个切片（large-v3 + CUDA 安全上限）
 
 
 def _call_whisper_subprocess(
@@ -109,6 +109,7 @@ def _call_whisper_subprocess(
     progress_cb: Optional[Callable[[float], None]] = None,
     total_chunks: int = 1,
     chunk_idx: int = 0,
+    _retry_count: int = 0,
 ) -> list[dict]:
     """在独立子进程中运行 Whisper，通过临时文件传递进度和结果"""
     import tempfile
@@ -155,12 +156,31 @@ def _call_whisper_subprocess(
         _time.sleep(0.5)
 
     if proc.returncode != 0:
-        stderr = proc.stderr.read().decode("utf-8", errors="replace")
         for p in (result_path, progress_path):
             try:
                 os.unlink(p)
             except Exception:
                 pass
+
+        # 崩溃重试：把当前 chunk 对半切开，递归处理（最多重试 2 次）
+        if _retry_count < 2:
+            duration = _get_audio_duration(audio_path)
+            if duration > 30:
+                import tempfile as _tf
+                half = duration / 2
+                all_segs = []
+                with _tf.TemporaryDirectory() as tmp:
+                    chunks = _split_audio_chunks(audio_path, int(half), tmp)
+                    for ci, (cp, off) in enumerate(chunks):
+                        segs = _call_whisper_subprocess(
+                            cp, model_name, language, initial_prompt,
+                            time_offset=time_offset + off, progress_cb=None,
+                            _retry_count=_retry_count + 1,
+                        )
+                        all_segs.extend(segs)
+                return all_segs
+
+        stderr = proc.stderr.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"Whisper 进程崩溃 (exit {proc.returncode}): {stderr[:500]}")
 
     if not os.path.exists(result_path):
