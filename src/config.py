@@ -93,9 +93,10 @@ class Settings:
         {"name": "OpenAI", "base_url": "https://api.openai.com/v1", "api_key": "", "model": "whisper-1", "api_type": "whisper"},
     ])
     ollama_url: str = "http://localhost:11434"
-    vision_concurrent: int = 1  # 图片理解并发数（云端可 4-8，本地建议 1-2）
+    vision_concurrent: int = 4  # 图片理解并发数（本地 Ollama 4，云端可 4-8）
     vision_active: str = "minicpm-v 本地"  # 当前激活的视觉模型名称
     vision_models: list = field(default_factory=lambda: [
+        {"name": "Gemma4:26b 本地", "type": "ollama", "model": "gemma4:26b", "url": "http://localhost:11434", "api_key": "", "prompt_strategy": "single"},
         {"name": "minicpm-v 本地", "type": "ollama", "model": "minicpm-v:8b", "url": "http://localhost:11434", "api_key": "", "prompt_strategy": "triple"},
         {"name": "GLM-4V 云端", "type": "cloud", "model": "glm-4v-plus", "url": "https://open.bigmodel.cn/api/paas/v4", "api_key": "", "prompt_strategy": "single"},
         {"name": "Qwen-VL 云端", "type": "cloud", "model": "qwen-vl-max", "url": "https://dashscope.aliyuncs.com/compatible-mode/v1", "api_key": "", "prompt_strategy": "single"},
