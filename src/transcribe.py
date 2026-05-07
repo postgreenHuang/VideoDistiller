@@ -214,6 +214,7 @@ def _transcribe_local(
     initial_prompt: Optional[str] = None,
     segment_length: int = 180,
     progress_cb: Optional[Callable[[float], None]] = None,
+    max_workers: int = 2,
 ) -> list[dict]:
     duration = _get_audio_duration(audio_path)
 
@@ -225,16 +226,46 @@ def _transcribe_local(
         )
     else:
         import tempfile
+        import threading
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
         with tempfile.TemporaryDirectory() as tmp_dir:
             chunks = _split_audio_chunks(audio_path, _LOCAL_CHUNK_SECONDS, tmp_dir)
+            n = len(chunks)
+            chunk_progress = [0.0] * n
+            plock = threading.Lock()
+
+            def _chunk_progress_cb(idx, total, cb):
+                if not cb:
+                    return lambda v: None
+                def cb_wrapper(v):
+                    with plock:
+                        chunk_progress[idx] = v
+                        overall = sum(chunk_progress) / total
+                        cb(overall)
+                return cb_wrapper
+
             raw_segments = []
-            for i, (chunk_path, offset) in enumerate(chunks):
-                segs = _call_whisper_subprocess(
-                    chunk_path, model_name, language, initial_prompt,
-                    time_offset=offset, progress_cb=progress_cb,
-                    total_chunks=len(chunks), chunk_idx=i,
-                )
-                raw_segments.extend(segs)
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {}
+                for i, (chunk_path, offset) in enumerate(chunks):
+                    f = executor.submit(
+                        _call_whisper_subprocess,
+                        chunk_path, model_name, language, initial_prompt,
+                        offset, _chunk_progress_cb(i, n, progress_cb),
+                    )
+                    futures[f] = i
+
+                for f in as_completed(futures):
+                    idx = futures[f]
+                    try:
+                        segs = f.result()
+                        raw_segments.extend(segs)
+                    except Exception as e:
+                        raise RuntimeError(f"Chunk {idx} 转录失败: {e}")
+
+            # 按时间排序（并发结果顺序不确定）
+            raw_segments.sort(key=lambda s: s["start"])
 
     merged = _merge_segments(raw_segments, segment_length)
     return _enrich_segments(merged)
