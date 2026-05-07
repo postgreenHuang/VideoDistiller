@@ -1592,9 +1592,13 @@ class _GenerateWorker(QThread):
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {api_key}",
             }
-            resp = requests.post(url, json=payload, headers=headers, timeout=180)
+            resp = requests.post(url, json=payload, headers=headers, timeout=600)
             resp.raise_for_status()
-            notes_text = resp.json()["choices"][0]["message"]["content"].strip()
+            resp_data = resp.json()
+            notes_text = resp_data["choices"][0]["message"]["content"].strip()
+            finish_reason = resp_data["choices"][0].get("finish_reason", "")
+            if finish_reason == "length":
+                notes_text += "\n\n---\n> ⚠ 笔记被 max_tokens 截断，内容不完整。"
 
             notes_dir = os.path.join(self.project_dir, "notes")
             os.makedirs(notes_dir, exist_ok=True)
@@ -1887,9 +1891,13 @@ class _BatchWorker(QThread):
                         "Content-Type": "application/json",
                         "Authorization": f"Bearer {api_key}",
                     }
-                    resp = requests.post(url, json=payload, headers=headers, timeout=300)
+                    resp = requests.post(url, json=payload, headers=headers, timeout=600)
                     resp.raise_for_status()
-                    notes_text = resp.json()["choices"][0]["message"]["content"].strip()
+                    resp_data = resp.json()
+                    notes_text = resp_data["choices"][0]["message"]["content"].strip()
+                    finish_reason = resp_data["choices"][0].get("finish_reason", "")
+                    if finish_reason == "length":
+                        notes_text += "\n\n---\n> ⚠ 笔记被 max_tokens 截断，内容不完整。"
 
                     notes_dir = os.path.join(project_dir, "notes")
                     os.makedirs(notes_dir, exist_ok=True)
