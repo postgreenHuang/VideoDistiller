@@ -142,10 +142,35 @@ class MessageBubble(QTextBrowser):
         font = QFont(family)
         font.setPixelSize(int(base_px))
 
-        # 预处理：把 "XX_XX_frame.jpg (描述)" 转为 "![描述](XX_XX_frame.jpg)"
+        # 预处理：统一各种非标准图片引用为标准 Markdown 格式
+        # 宽松文件名匹配：XX_XX 开头 + 可选 _frame + .jpg/.jpeg/.png
+        _IMG_RE = r'(\d{2}_\d{2}(?:_\w+)?\.(?:jpg|jpeg|png))'
+
+        # 格式1: "XX_XX_frame.jpg (描述)" → ![描述](XX_XX_frame.jpg)
         text = re.sub(
-            r'(\d{2}_\d{2}_frame\.(?:jpg|jpeg|png))\s*\(([^)]+)\)',
+            _IMG_RE + r'\s*\(([^)]+)\)',
             r'![\2](\1)',
+            text,
+        )
+
+        # 格式2: "XX_XX_frame.jpg: 描述" → ![描述](XX_XX_frame.jpg)
+        text = re.sub(
+            _IMG_RE + r':\s*(.+?)(?:\n|$)',
+            r'![\2](\1)\n',
+            text,
+        )
+
+        # 格式3: "[截图引用：a.jpg, b.jpg, c.jpg]" → 逐个展开为 ![截图](a.jpg)
+        def _expand_bracket_list(m):
+            content = m.group(1)
+            files = re.findall(r'\d{2}_\d{2}(?:_\w+)?\.(?:jpg|jpeg|png)', content)
+            return "\n".join(f"![截图]({f})" for f in files)
+        text = re.sub(r'\[截图引用[：:]\s*([^\]]+)\]', _expand_bracket_list, text)
+
+        # 格式4: 裸文件名单独一行 "XX_XX_frame.jpg" → ![截图](XX_XX_frame.jpg)
+        text = re.sub(
+            r'(?<!!\[)\b(\d{2}_\d{2}(?:_\w+)?\.(?:jpg|jpeg|png))\b(?!\))',
+            r'![截图](\1)',
             text,
         )
 
