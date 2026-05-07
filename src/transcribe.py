@@ -96,6 +96,9 @@ def _enrich_segments(segments: list[dict]) -> list[dict]:
 
 # ─── 本地 faster-whisper ───
 
+_LOCAL_CHUNK_SECONDS = 600  # 10 分钟一个切片，防止长音频 CUDA OOM 崩溃
+
+
 def _transcribe_local(
     audio_path: str,
     model_name: str = "large-v3",
@@ -117,21 +120,27 @@ def _transcribe_local(
     lang = language if language and language != "auto" else None
     prompt = initial_prompt if initial_prompt else None
 
-    segments_iter, info = model.transcribe(
-        audio_path, language=lang, initial_prompt=prompt,
-        condition_on_previous_text=True, vad_filter=True,
-    )
+    duration = _get_audio_duration(audio_path)
 
-    raw_segments = []
-    total_duration = info.duration
-    for seg in segments_iter:
-        raw_segments.append({
-            "start": round(seg.start, 2),
-            "end": round(seg.end, 2),
-            "text": seg.text.strip(),
-        })
-        if progress_cb and total_duration > 0:
-            progress_cb(min(seg.end / total_duration, 1.0))
+    # 短音频（<10 分钟）直接转录
+    if duration <= 0 or duration <= _LOCAL_CHUNK_SECONDS:
+        raw_segments = _transcribe_chunk(
+            model, audio_path, lang, prompt, 0.0, progress_cb, duration,
+        )
+    else:
+        # 长音频切片转录，每片独立处理避免 OOM
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            chunks = _split_audio_chunks(audio_path, _LOCAL_CHUNK_SECONDS, tmp_dir)
+            raw_segments = []
+            for i, (chunk_path, offset) in enumerate(chunks):
+                chunk_segs = _transcribe_chunk(
+                    model, chunk_path, lang, prompt, offset,
+                    None, 0.0,
+                )
+                raw_segments.extend(chunk_segs)
+                if progress_cb:
+                    progress_cb((i + 1) / len(chunks))
 
     merged = _merge_segments(raw_segments, segment_length)
 
@@ -145,6 +154,30 @@ def _transcribe_local(
         pass
 
     return _enrich_segments(merged)
+
+
+def _transcribe_chunk(
+    model, audio_path: str, language: Optional[str],
+    initial_prompt: Optional[str], time_offset: float,
+    progress_cb, total_duration: float,
+) -> list[dict]:
+    """转录单个音频片段，返回带偏移量的 raw_segments"""
+    segments_iter, info = model.transcribe(
+        audio_path, language=language, initial_prompt=initial_prompt,
+        condition_on_previous_text=True, vad_filter=True,
+    )
+
+    raw_segments = []
+    for seg in segments_iter:
+        raw_segments.append({
+            "start": round(seg.start + time_offset, 2),
+            "end": round(seg.end + time_offset, 2),
+            "text": seg.text.strip(),
+        })
+        if progress_cb and total_duration > 0:
+            progress_cb(min((seg.end + time_offset) / total_duration, 1.0))
+
+    return raw_segments
 
 
 # ─── DashScope SDK (qwen-asr 系列) ───
