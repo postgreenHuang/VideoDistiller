@@ -8,6 +8,7 @@ Video-Distiller 语音转录模块
 import json
 import os
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import Optional, Callable
@@ -94,9 +95,96 @@ def _enrich_segments(segments: list[dict]) -> list[dict]:
     return segments
 
 
-# ─── 本地 faster-whisper ───
+# ─── 本地 faster-whisper（子进程隔离 CUDA） ───
 
-_LOCAL_CHUNK_SECONDS = 600  # 10 分钟一个切片，防止长音频 CUDA OOM 崩溃
+_LOCAL_CHUNK_SECONDS = 600  # 10 分钟一个切片
+
+
+def _call_whisper_subprocess(
+    audio_path: str,
+    model_name: str = "large-v3",
+    language: Optional[str] = None,
+    initial_prompt: Optional[str] = None,
+    time_offset: float = 0.0,
+    progress_cb: Optional[Callable[[float], None]] = None,
+    total_chunks: int = 1,
+    chunk_idx: int = 0,
+) -> list[dict]:
+    """在独立子进程中运行 Whisper，通过临时文件传递进度和结果"""
+    import tempfile
+    import time as _time
+
+    result_path = os.path.join(tempfile.gettempdir(), f"whisper_result_{os.getpid()}_{chunk_idx}.json")
+    progress_path = os.path.join(tempfile.gettempdir(), f"whisper_prog_{os.getpid()}_{chunk_idx}.json")
+    for p in (result_path, progress_path):
+        if os.path.exists(p):
+            os.unlink(p)
+
+    worker_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_whisper_worker.py")
+    cmd = [sys.executable, worker_script,
+           "--audio", audio_path,
+           "--model", model_name,
+           "--result", result_path,
+           "--progress", progress_path]
+    if language and language != "auto":
+        cmd.extend(["--language", language])
+    if initial_prompt:
+        cmd.extend(["--prompt", initial_prompt])
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+    )
+
+    last_progress = 0.0
+    while proc.poll() is None:
+        if os.path.exists(progress_path):
+            try:
+                with open(progress_path, "r") as f:
+                    p = float(f.read().strip())
+                if p > last_progress:
+                    last_progress = p
+                    if progress_cb and total_chunks > 1:
+                        progress_cb((chunk_idx + p) / total_chunks)
+                    elif progress_cb:
+                        progress_cb(p)
+            except Exception:
+                pass
+        _time.sleep(0.5)
+
+    if proc.returncode != 0:
+        stderr = proc.stderr.read().decode("utf-8", errors="replace")
+        for p in (result_path, progress_path):
+            try:
+                os.unlink(p)
+            except Exception:
+                pass
+        raise RuntimeError(f"Whisper 进程崩溃 (exit {proc.returncode}): {stderr[:500]}")
+
+    if not os.path.exists(result_path):
+        for p in (result_path, progress_path):
+            try:
+                os.unlink(p)
+            except Exception:
+                pass
+        raise RuntimeError("Whisper 进程结束但未生成结果文件")
+
+    with open(result_path, "r", encoding="utf-8") as f:
+        raw_segments = json.load(f)
+
+    for seg in raw_segments:
+        seg["start"] = round(seg["start"] + time_offset, 2)
+        seg["end"] = round(seg["end"] + time_offset, 2)
+
+    for p in (result_path, progress_path):
+        try:
+            os.unlink(p)
+        except Exception:
+            pass
+
+    return raw_segments
 
 
 def _transcribe_local(
@@ -107,77 +195,29 @@ def _transcribe_local(
     segment_length: int = 180,
     progress_cb: Optional[Callable[[float], None]] = None,
 ) -> list[dict]:
-    from faster_whisper import WhisperModel
-
-    try:
-        import torch
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-    except ImportError:
-        device = "cpu"
-    compute = "float16" if device == "cuda" else "int8"
-    model = WhisperModel(model_name, device=device, compute_type=compute)
-
-    lang = language if language and language != "auto" else None
-    prompt = initial_prompt if initial_prompt else None
-
     duration = _get_audio_duration(audio_path)
 
-    # 短音频（<10 分钟）直接转录
     if duration <= 0 or duration <= _LOCAL_CHUNK_SECONDS:
-        raw_segments = _transcribe_chunk(
-            model, audio_path, lang, prompt, 0.0, progress_cb, duration,
+        raw_segments = _call_whisper_subprocess(
+            audio_path, model_name, language, initial_prompt,
+            time_offset=0.0, progress_cb=progress_cb,
+            total_chunks=1, chunk_idx=0,
         )
     else:
-        # 长音频切片转录，每片独立处理避免 OOM
         import tempfile
         with tempfile.TemporaryDirectory() as tmp_dir:
             chunks = _split_audio_chunks(audio_path, _LOCAL_CHUNK_SECONDS, tmp_dir)
             raw_segments = []
             for i, (chunk_path, offset) in enumerate(chunks):
-                chunk_segs = _transcribe_chunk(
-                    model, chunk_path, lang, prompt, offset,
-                    None, 0.0,
+                segs = _call_whisper_subprocess(
+                    chunk_path, model_name, language, initial_prompt,
+                    time_offset=offset, progress_cb=progress_cb,
+                    total_chunks=len(chunks), chunk_idx=i,
                 )
-                raw_segments.extend(chunk_segs)
-                if progress_cb:
-                    progress_cb((i + 1) / len(chunks))
+                raw_segments.extend(segs)
 
     merged = _merge_segments(raw_segments, segment_length)
-
-    # 释放 GPU 显存，避免影响后续 Ollama 等模型
-    del model
-    try:
-        import torch
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    except ImportError:
-        pass
-
     return _enrich_segments(merged)
-
-
-def _transcribe_chunk(
-    model, audio_path: str, language: Optional[str],
-    initial_prompt: Optional[str], time_offset: float,
-    progress_cb, total_duration: float,
-) -> list[dict]:
-    """转录单个音频片段，返回带偏移量的 raw_segments"""
-    segments_iter, info = model.transcribe(
-        audio_path, language=language, initial_prompt=initial_prompt,
-        condition_on_previous_text=True, vad_filter=True,
-    )
-
-    raw_segments = []
-    for seg in segments_iter:
-        raw_segments.append({
-            "start": round(seg.start + time_offset, 2),
-            "end": round(seg.end + time_offset, 2),
-            "text": seg.text.strip(),
-        })
-        if progress_cb and total_duration > 0:
-            progress_cb(min((seg.end + time_offset) / total_duration, 1.0))
-
-    return raw_segments
 
 
 # ─── DashScope SDK (qwen-asr 系列) ───
