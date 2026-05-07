@@ -277,6 +277,16 @@ class MainWindow(QMainWindow):
         self.batch_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
         right.addWidget(self.batch_status)
 
+        # 实时计时器
+        self.batch_step_timer_label = QLabel(" ")
+        self.batch_step_timer_label.setProperty("class", "hint")
+        self.batch_step_timer_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        right.addWidget(self.batch_step_timer_label)
+        self._batch_step_t0 = 0.0
+        self._batch_step_timer = QTimer(self)
+        self._batch_step_timer.setInterval(1000)
+        self._batch_step_timer.timeout.connect(self._tick_batch_step_timer)
+
         right.addStretch()
         mid.addLayout(right, stretch=2)
 
@@ -390,6 +400,8 @@ class MainWindow(QMainWindow):
         self._batch_worker.video_progress.connect(self._batch_on_video_progress)
         self._batch_worker.log.connect(self._batch_on_log)
         self._batch_worker.finished.connect(self._batch_on_done)
+        self._batch_worker.step_time.connect(self._batch_on_step_time)
+        self._batch_worker.step_start.connect(self._batch_on_step_start)
         self._batch_worker.start()
 
     def _batch_start(self):
@@ -429,6 +441,8 @@ class MainWindow(QMainWindow):
         self._batch_worker.video_progress.connect(self._batch_on_video_progress)
         self._batch_worker.log.connect(self._batch_on_log)
         self._batch_worker.finished.connect(self._batch_on_done)
+        self._batch_worker.step_time.connect(self._batch_on_step_time)
+        self._batch_worker.step_start.connect(self._batch_on_step_start)
         self._batch_worker.start()
 
     def _batch_stop(self):
@@ -442,7 +456,30 @@ class MainWindow(QMainWindow):
     def _batch_on_video_progress(self, cur: int, total: int):
         self.batch_status.setText(f"{cur}/{total} 视频")
 
+    def _batch_on_step_start(self, step_name: str):
+        import time
+        self._batch_step_t0 = time.time()
+        self.batch_step_timer_label.setText(f"{step_name}  0s")
+        self._batch_step_timer.start()
+
+    def _batch_on_step_time(self, msg: str):
+        self._batch_step_timer.stop()
+        self.batch_step_timer_label.setText(msg)
+
+    def _tick_batch_step_timer(self):
+        import time
+        if self._batch_step_t0 > 0:
+            elapsed = int(time.time() - self._batch_step_t0)
+            if elapsed < 60:
+                t = f"{elapsed}s"
+            else:
+                t = f"{elapsed // 60}m {elapsed % 60:02d}s"
+            current = self.batch_step_timer_label.text().split("  ")[0]
+            self.batch_step_timer_label.setText(f"{current}  {t}")
+
     def _batch_on_done(self, ok: bool, msg: str):
+        self._batch_step_timer.stop()
+        self.batch_step_timer_label.setText(" ")
         self.btn_batch_start.setText("开始批量蒸馏")
         self.btn_batch_start.clicked.disconnect()
         self.btn_batch_start.clicked.connect(self._batch_start)
@@ -1580,6 +1617,8 @@ class _BatchWorker(QThread):
     progress = Signal(float)
     video_progress = Signal(int, int)
     log = Signal(str)
+    step_time = Signal(str)       # "Step N 耗时 Xm Xs"
+    step_start = Signal(str)      # 当前步骤名称，用于实时计时
     finished = Signal(bool, str)
 
     def __init__(self, videos, output_dir, settings,
@@ -1602,6 +1641,13 @@ class _BatchWorker(QThread):
         def cb(v):
             self.progress.emit(min(base + weight * v, 1.0))
         return cb
+
+    @staticmethod
+    def _fmt_elapsed(seconds: float) -> str:
+        s = int(seconds)
+        if s < 60:
+            return f"{s}s"
+        return f"{s // 60}m {s % 60:02d}s"
 
     def run(self):
         import json, requests, shutil
@@ -1649,6 +1695,8 @@ class _BatchWorker(QThread):
 
                 # Step 1: 媒体提取
                 if start_step <= 0:
+                    _t0 = __import__("time").time()
+                    self.step_start.emit("Step 1 媒体提取")
                     self.log.emit(f"  Step 1 媒体提取...")
                     audio_dir = os.path.join(project_dir, "audio")
                     extract_audio(
@@ -1662,7 +1710,9 @@ class _BatchWorker(QThread):
                         fps=fps, resolution_scale=s.resolution_scale,
                         progress_cb=self._step_progress_cb(step_weights, i, total, 0),
                     )
-                    self.log.emit(f"  Step 1 完成")
+                    _dt = self._fmt_elapsed(__import__("time").time() - _t0)
+                    self.step_time.emit(f"Step 1: {_dt}")
+                    self.log.emit(f"  Step 1 完成 ({_dt})")
                 else:
                     audio_dir = os.path.join(project_dir, "audio")
 
@@ -1671,6 +1721,8 @@ class _BatchWorker(QThread):
 
                 # Step 2: 语音转录
                 if start_step <= 1:
+                    _t0 = __import__("time").time()
+                    self.step_start.emit("Step 2 语音转录")
                     self.log.emit(f"  Step 2 语音转录...")
                     mp3_files = list(Path(audio_dir).glob("*.mp3"))
                     if not mp3_files:
@@ -1707,7 +1759,9 @@ class _BatchWorker(QThread):
                         asr_api_type=asr_api_type,
                         progress_cb=self._step_progress_cb(step_weights, i, total, 1),
                     )
-                    self.log.emit(f"  Step 2 完成")
+                    _dt = self._fmt_elapsed(__import__("time").time() - _t0)
+                    self.step_time.emit(f"Step 2: {_dt}")
+                    self.log.emit(f"  Step 2 完成 ({_dt})")
 
                 if self._cancel:
                     break
@@ -1715,6 +1769,8 @@ class _BatchWorker(QThread):
                 # Step 3: 智能选帧
                 key_frames_dir = os.path.join(project_dir, "key_frames")
                 if start_step <= 2:
+                    _t0 = __import__("time").time()
+                    self.step_start.emit("Step 3 智能选帧")
                     self.log.emit(f"  Step 3 智能选帧...")
                     unified_path = os.path.join(project_dir, f"{name}.json")
                     if os.path.exists(unified_path):
@@ -1727,7 +1783,9 @@ class _BatchWorker(QThread):
                         self.select_provider,
                         progress_cb=self._step_progress_cb(step_weights, i, total, 2),
                     )
-                    self.log.emit(f"  Step 3 选出 {select_result['selected']} 帧")
+                    _dt = self._fmt_elapsed(__import__("time").time() - _t0)
+                    self.step_time.emit(f"Step 3: {_dt}")
+                    self.log.emit(f"  Step 3 选出 {select_result['selected']} 帧 ({_dt})")
                 else:
                     # Step 3 已跳过，直接检查 key_frames 目录
                     key_frame_count = len(list(Path(key_frames_dir).glob("*.jpg"))) if os.path.isdir(key_frames_dir) else 0
@@ -1744,6 +1802,8 @@ class _BatchWorker(QThread):
                     has_slides = select_result['selected'] > 0 and os.path.exists(key_frames_dir) and list(Path(key_frames_dir).glob("*.jpg"))
 
                     if has_slides:
+                        _t0 = __import__("time").time()
+                        self.step_start.emit("Step 4 图片理解")
                         self.log.emit(f"  Step 4 图片理解...")
                         vision_cfg = dict(self.vision_config) if self.vision_config else {}
                         if not vision_cfg.get("url"):
@@ -1772,7 +1832,9 @@ class _BatchWorker(QThread):
                             unified_json_path=unified_json,
                             max_concurrent=s.vision_concurrent,
                         )
-                        self.log.emit(f"  Step 4 完成")
+                        _dt = self._fmt_elapsed(__import__("time").time() - _t0)
+                        self.step_time.emit(f"Step 4: {_dt}")
+                        self.log.emit(f"  Step 4 完成 ({_dt})")
                     else:
                         self.log.emit(f"  Step 4 跳过（无关键帧，仅使用转录）")
 
@@ -1781,6 +1843,8 @@ class _BatchWorker(QThread):
 
                 # Step 5: AI 聚合
                 if start_step <= 4:
+                    _t0 = __import__("time").time()
+                    self.step_start.emit("Step 5 AI 聚合")
                     self.log.emit(f"  Step 5 AI 聚合...")
 
                     slides_text = ""
@@ -1836,7 +1900,9 @@ class _BatchWorker(QThread):
                     from src.chat import create_session
                     create_session(project_dir, name, notes_path, self.agg_provider)
 
-                    self.log.emit(f"  ✓ {name} 笔记已生成\n")
+                    _dt = self._fmt_elapsed(__import__("time").time() - _t0)
+                    self.step_time.emit(f"Step 5: {_dt}")
+                    self.log.emit(f"  ✓ {name} 笔记已生成 ({_dt})\n")
                 success += 1
 
             except Exception as e:
