@@ -174,8 +174,9 @@ requests, Pillow, pyinstaller, numpy, dashscope
 ## 当前硬件
 
 i9-11代 / 64GB RAM / NVIDIA RTX 3090 24GB VRAM
+- PyTorch 2.11.0+cu126 (CUDA 12.6)
 - Ollama 可用 CUDA 加速，视觉模型可本地跑
-- faster-whisper 可用 CUDA（当前仍用 int8 CPU 模式）
+- faster-whisper 用 CUDA float16 跑 large-v3
 - 同时有 Mac 设备用于跨平台测试
 
 ## 对话系统架构决策

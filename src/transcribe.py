@@ -134,6 +134,16 @@ def _transcribe_local(
             progress_cb(min(seg.end / total_duration, 1.0))
 
     merged = _merge_segments(raw_segments, segment_length)
+
+    # 释放 GPU 显存，避免影响后续 Ollama 等模型
+    del model
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except ImportError:
+        pass
+
     return _enrich_segments(merged)
 
 
