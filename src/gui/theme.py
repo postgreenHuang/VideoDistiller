@@ -538,6 +538,24 @@ def build_stylesheet(theme_name: str) -> str:
         padding: 2px;
     }}
 
+    QPushButton[class="chat-quick-btn"] {{
+        background: {c['input_bg']};
+        border: 1px solid {c['border']};
+        border-radius: 4px;
+        padding: 3px 6px;
+        font-size: 13px;
+        color: {c['text']};
+        min-height: 20px;
+    }}
+    QPushButton[class="chat-quick-btn"]:hover {{
+        background: {c['surface']};
+        border-color: {c['accent']};
+    }}
+    QPushButton[class="chat-quick-btn"]:pressed {{
+        background: {c['accent']};
+        color: #ffffff;
+    }}
+
     /* ─── Chat 消息气泡 ─── */
     QTextBrowser[class="msg-user"] {{
         background: {c['accent']};

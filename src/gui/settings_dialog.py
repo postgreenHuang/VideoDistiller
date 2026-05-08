@@ -37,6 +37,7 @@ class SettingsDialog(QDialog):
         tabs.addTab(self._build_vision_tab(), "图片识别")
         tabs.addTab(self._build_asr_tab(), "语音识别")
         tabs.addTab(self._build_aggregation_tab(), "AI 聚合")
+        tabs.addTab(self._build_quick_questions_tab(), "快捷提问")
         layout.addWidget(tabs)
 
         btns = QDialogButtonBox(
@@ -578,6 +579,108 @@ class SettingsDialog(QDialog):
         scroll.setWidget(content)
         return scroll
 
+    # ─── 快捷提问 Tab ───
+
+    def _build_quick_questions_tab(self):
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setStyleSheet(
+            "QScrollArea, QScrollArea > QWidget > QWidget { background: transparent; }"
+        )
+        scroll.viewport().setStyleSheet("background: transparent;")
+
+        content = QWidget()
+        content.setStyleSheet("background: transparent;")
+        layout = QVBoxLayout(content)
+        layout.setSpacing(8)
+        layout.setContentsMargins(0, 0, 4, 0)
+
+        hint = QLabel("添加常用的学习提问模板，对话界面可一键选用")
+        hint.setProperty("class", "hint")
+        layout.addWidget(hint)
+
+        # 卡片容器
+        self._qq_container = QWidget()
+        self._qq_container.setStyleSheet("background: transparent;")
+        self._qq_cards_layout = QVBoxLayout(self._qq_container)
+        self._qq_cards_layout.setSpacing(8)
+        self._qq_cards_layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self._qq_container)
+
+        btn_add = QPushButton("+ 新增提问")
+        btn_add.clicked.connect(self._add_qq_card)
+        layout.addWidget(btn_add)
+
+        layout.addStretch()
+        scroll.setWidget(content)
+        return scroll
+
+    def _build_qq_card(self, data: dict) -> QGroupBox:
+        card = QGroupBox()
+        card.setStyleSheet("QGroupBox { margin-top: 10px; }")
+        layout = QVBoxLayout(card)
+        layout.setSpacing(4)
+        layout.setContentsMargins(12, 14, 12, 8)
+
+        # 标题行: 名称 + 删除
+        top = QHBoxLayout()
+        top.setSpacing(6)
+        top.addWidget(QLabel("名称:"))
+        name_edit = QLineEdit(data.get("name", ""))
+        name_edit.setPlaceholderText("提问名称，如: 总结要点")
+        top.addWidget(name_edit, stretch=1)
+        btn_del = QPushButton("删除")
+        btn_del.setFixedWidth(56)
+        btn_del.setProperty("class", "secondary")
+        top.addWidget(btn_del)
+        layout.addLayout(top)
+
+        text_edit = QTextEdit()
+        text_edit.setPlainText(data.get("text", ""))
+        text_edit.setPlaceholderText("输入完整问句，如: 请总结当前章节的核心要点")
+        text_edit.setMaximumHeight(70)
+        layout.addWidget(text_edit)
+
+        data["_widgets"] = {
+            "name": name_edit,
+            "text": text_edit,
+            "card": card,
+        }
+        btn_del.clicked.connect(lambda checked, d=data: self._del_qq_card(d))
+        return card
+
+    def _rebuild_qq_cards(self):
+        while self._qq_cards_layout.count():
+            item = self._qq_cards_layout.takeAt(0)
+            w = item.widget()
+            if w:
+                w.setParent(None)
+                w.deleteLater()
+        for data in self._qq_data:
+            card = self._build_qq_card(data)
+            self._qq_cards_layout.addWidget(card)
+
+    def _collect_qq_data(self):
+        for data in self._qq_data:
+            w = data.get("_widgets")
+            if w:
+                data["name"] = w["name"].text()
+                data["text"] = w["text"].toPlainText()
+
+    def _add_qq_card(self):
+        self._collect_qq_data()
+        new_data = {"name": "", "text": ""}
+        self._qq_data.append(new_data)
+        card = self._build_qq_card(new_data)
+        self._qq_cards_layout.addWidget(card)
+
+    def _del_qq_card(self, data: dict):
+        self._collect_qq_data()
+        if data in self._qq_data:
+            self._qq_data.remove(data)
+        self._rebuild_qq_cards()
+
     # ─── Provider 卡片管理 ───
 
     def _build_provider_card(self, data: dict) -> QGroupBox:
@@ -786,6 +889,10 @@ class SettingsDialog(QDialog):
         # AI 聚合
         self._providers_data = [dict(p) for p in s.providers]
         self._rebuild_provider_cards()
+
+        # 快捷提问
+        self._qq_data = [dict(q) for q in s.quick_questions]
+        self._rebuild_qq_cards()
         self.prompt_edit.setPlainText(s.default_distill_prompt)
 
     def _save(self):
@@ -794,6 +901,7 @@ class SettingsDialog(QDialog):
         self._collect_asr_cloud_data()
         self._collect_provider_data()
         self._collect_vocab_data()
+        self._collect_qq_data()
 
         s = self.settings
 
@@ -833,6 +941,9 @@ class SettingsDialog(QDialog):
         # AI 聚合
         s.providers = [{k: v for k, v in d.items() if k != "_widgets"} for d in self._providers_data]
         s.default_distill_prompt = self.prompt_edit.toPlainText()
+
+        # 快捷提问
+        s.quick_questions = [{k: v for k, v in d.items() if k != "_widgets"} for d in self._qq_data]
 
         save_settings(s)
         self.accept()

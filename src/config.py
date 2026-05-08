@@ -112,6 +112,12 @@ class Settings:
         {"name": "Unreal Engine", "terms": "Unreal, UE5, Nanite, Lumen, MetaHuman, Niagara, Chaos, Blueprint, World Partition, Gameplay Ability System, GAS, Enhanced Input, Lyra, Verse"},
         {"name": "Unity", "terms": "Unity, GameObject, MonoBehaviour, Prefab, ScriptableObject, NavMesh, Animator, URP, HDRP, Shader Graph, VFX Graph, DOTS, ECS, Burst, Job System"},
     ])
+    quick_questions: list = field(default_factory=lambda: [
+        {"name": "总结要点", "text": "请总结当前章节的核心要点"},
+        {"name": "术语解释", "text": "请列出这段内容中出现的所有专业术语，并逐一解释"},
+        {"name": "举例说明", "text": "请用通俗易懂的例子来说明这个概念"},
+        {"name": "对比分析", "text": "请对比分析这里提到的几个概念/方案的异同"},
+    ])
     default_distill_prompt: str = (
         "你是一位经验丰富的技术导师。我会给你提供一段技术演讲的幻灯片文字描述和语音转录。\n"
         "请生成一份面向学习者的结构化笔记，严格按以下层次输出：\n\n"
@@ -128,8 +134,9 @@ class Settings:
         "- 讲者提到的关键数值、性能指标\n"
         "- 根据幻灯片文字修正转录中的术语错误\n"
         "- 如果该章节有关键幻灯片截图，用以下格式引用（每张图独占一行）：\n"
-        "  `![章节描述](文件名.jpg)`\n"
-        "  其中文件名来自幻灯片数据中的 file 字段，例如 `![UE编辑器界面](05_12_frame.jpg)`\n\n"
+        "  `![章节描述](文件名)`\n"
+        "  其中文件名必须逐字复制幻灯片描述中「文件:」后面的文件名，例如 `![UE编辑器界面](05_12_frame.jpg)`\n"
+        "  绝对不要自己编造文件名（如 img_0、image_1 等），必须使用幻灯片描述中提供的真实文件名\n\n"
         "## 截图索引\n"
         "列出笔记中引用的所有截图，格式为每行一个：\n"
         "`![截图描述](文件名.jpg)`\n\n"
@@ -145,9 +152,9 @@ class Settings:
         "## 拓展学习\n"
         "推荐的参考文献、书籍、视频资源（讲者提到的或相关的），每条附一句话说明价值。\n\n"
         "【重要】截图引用格式规则：\n"
-        "- 只使用标准 Markdown 图片语法：`![描述文字](文件名.jpg)`\n"
-        "- 文件名必须是幻灯片数据中的原始文件名（如 05_12_frame.jpg），不要添加路径前缀\n"
-        "- 不要使用其他任何格式（如纯文本、HTML、带括号的文件名等）\n"
+        "- 只使用标准 Markdown 图片语法：`![描述文字](文件名)`\n"
+        "- 文件名必须逐字复制幻灯片描述中「文件:」后面的内容（如 00_05_frame.jpg），不要添加路径前缀\n"
+        "- 不要自己编造文件名（如 img_0、image_1、screenshot_1 等都不是有效文件名）\n"
         "- 如果没有可引用的截图，不要强行引用"
     )
     vision_prompt_ocr: str = (

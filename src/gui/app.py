@@ -23,6 +23,55 @@ from src.gui.theme import build_stylesheet
 from src.gui.settings_dialog import SettingsDialog
 
 
+def _format_slides_as_text(slides: list) -> str:
+    """将 slides 列表格式化为结构化文本，让 AI 清晰看到文件名"""
+    lines = []
+    for i, s in enumerate(slides, 1):
+        ts = s.get("timestamp", "")
+        fname = s.get("file", "")
+        title = s.get("title", "")
+        text = s.get("text", "")
+        diagrams = s.get("diagrams", "")
+        lines.append(f"[截图{i}] 时间: {ts} | 文件: {fname}")
+        if title:
+            lines.append(f"  标题: {title}")
+        if text:
+            lines.append(f"  文字: {text}")
+        if diagrams and diagrams != "无":
+            lines.append(f"  图表: {diagrams}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _fix_image_refs(notes: str, slides: list) -> str:
+    """后处理：修复 AI 输出中的错误图片引用 (img_N → 实际文件名)"""
+    import re
+
+    # 构建文件名映射：按顺序映射 img_0, img_1, ... 和 00_05 这种简写
+    filenames = [s.get("file", "") for s in slides]
+
+    # 替换 img_N 模式
+    def _replace_img_n(m):
+        idx = int(m.group(1))
+        if idx < len(filenames) and filenames[idx]:
+            return filenames[idx]
+        return m.group(0)
+
+    notes = re.sub(r"img_(\d+)", _replace_img_n, notes)
+
+    # 替换只有时间戳没有 _frame.jpg 的情况，如 (00_05) → (00_05_frame.jpg)
+    def _fix_bare_timestamp(m):
+        mm, ss = m.group(1), m.group(2)
+        candidate = f"{mm}_{ss}_frame.jpg"
+        if candidate in filenames:
+            return candidate
+        return m.group(0)
+
+    notes = re.sub(r"\((\d{2})_(\d{2})\)", _fix_bare_timestamp, notes)
+
+    return notes
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1546,13 +1595,16 @@ class _GenerateWorker(QThread):
             slides_text = ""
             transcript_text = ""
 
+            slides_list = []  # 保留有序列表用于后处理
+
             # 从统一 JSON 读取
             if self.slides_path and os.path.exists(self.slides_path):
                 data = json.loads(Path(self.slides_path).read_text(encoding="utf-8"))
                 slides = data.get("slides", [])
                 segments = data.get("segments", [])
                 if slides:
-                    slides_text = json.dumps(slides, ensure_ascii=False, indent=2)
+                    slides_list = slides
+                    slides_text = _format_slides_as_text(slides)
                 if segments:
                     transcript_text = json.dumps(segments, ensure_ascii=False, indent=2)
 
@@ -1560,7 +1612,14 @@ class _GenerateWorker(QThread):
             if not slides_text and self.slides_path != self.transcript_path:
                 if self.slides_path and os.path.exists(self.slides_path):
                     data = json.loads(Path(self.slides_path).read_text(encoding="utf-8"))
-                    slides_text = json.dumps(data, ensure_ascii=False, indent=2)
+                    if isinstance(data, list):
+                        slides_list = data
+                        slides_text = _format_slides_as_text(data)
+                    elif "slides" in data:
+                        slides_list = data["slides"]
+                        slides_text = _format_slides_as_text(data["slides"])
+                    else:
+                        slides_text = json.dumps(data, ensure_ascii=False, indent=2)
             if not transcript_text and self.slides_path != self.transcript_path:
                 if self.transcript_path and os.path.exists(self.transcript_path):
                     data = json.loads(Path(self.transcript_path).read_text(encoding="utf-8"))
@@ -1597,6 +1656,8 @@ class _GenerateWorker(QThread):
             resp_data = resp.json()
             notes_text = resp_data["choices"][0]["message"]["content"].strip()
             finish_reason = resp_data["choices"][0].get("finish_reason", "")
+            if slides_list:
+                notes_text = _fix_image_refs(notes_text, slides_list)
             if finish_reason == "length":
                 notes_text += "\n\n---\n> ⚠ 笔记被 max_tokens 截断，内容不完整。"
 
@@ -1638,14 +1699,6 @@ class _BatchWorker(QThread):
         self._cancel = False
         self._failed_videos: list[str] = []
 
-    def _step_progress_cb(self, step_weights, video_idx, total_videos, step_idx):
-        """创建映射到整体进度的 progress_cb"""
-        base = video_idx / total_videos
-        weight = step_weights[step_idx] / total_videos
-        def cb(v):
-            self.progress.emit(min(base + weight * v, 1.0))
-        return cb
-
     @staticmethod
     def _fmt_elapsed(seconds: float) -> str:
         s = int(seconds)
@@ -1653,19 +1706,29 @@ class _BatchWorker(QThread):
             return f"{s}s"
         return f"{s // 60}m {s % 60:02d}s"
 
+    # ─── DAG 步骤定义 ───
+
+    # 步骤名 → (依赖列表, 是否用 GPU, 日志标签)
+    # GPU 互斥：同时最多 1 个 GPU 步骤（本地 Whisper 和本地 Ollama 共享 3090 VRAM）
+    # Step 4 显式依赖 Step 2：即使 3 先完成，也必须等 2 结束并释放显存后才能启动
+    _DAG = {
+        "1a": ([],                       False, "Step 1a 音频提取"),
+        "1b": ([],                       False, "Step 1b 帧提取"),
+        "2":  (["1a"],                   None,  "Step 2 语音转录"),   # None=运行时判断
+        "3":  (["1b", "2"],              False, "Step 3 智能选帧"),
+        "4":  (["3", "2"],               None,  "Step 4 图片理解"),   # 显式依赖 2
+        "5":  (["4"],                    False, "Step 5 AI 聚合"),
+    }
+
     def run(self):
-        import json, requests, shutil
-        from src.media import extract_audio, extract_frames
-        from src.transcribe import transcribe
-        from src.frame_selector import select_frames
-        from src.image_analysis import analyze_images
+        import json, requests
         from src.config import get_project_dir
+        from src.pipeline import get_completed_steps
 
         s = self.settings
         total = len(self.videos)
         success = 0
         failed = 0
-        step_weights = [0.05, 0.15, 0.05, 0.35, 0.40]  # Step 1-5 权重
 
         for i, video_path in enumerate(self.videos):
             if self._cancel:
@@ -1677,241 +1740,33 @@ class _BatchWorker(QThread):
             try:
                 project_dir = str(get_project_dir(self.output_dir, video_path))
 
-                # 检测已完成步骤，跳过
-                from src.pipeline import get_completed_steps
-                completed = get_completed_steps(project_dir)
-                start_step = 0
-                for si, ok in enumerate(completed):
+                # 检测已完成步骤，计算跳过集
+                completed_steps = get_completed_steps(project_dir)
+                skip = set()
+                for si, ok in enumerate(completed_steps):
                     if not ok:
-                        start_step = si
                         break
-                else:
-                    start_step = 5  # 全部完成
-
-                if start_step > 0:
-                    done_names = [f"Step {j+1}" for j in range(start_step) if completed[j]]
-                    self.log.emit(f"  跳过 {', '.join(done_names)} (已完成)，从 Step {start_step+1} 开始...")
-
-                if start_step >= 5:
+                    skip.add(str(si + 1))  # "1","2","3","4","5"
+                if all(completed_steps):
                     self.log.emit(f"  ✓ {name} 已全部完成，跳过\n")
                     success += 1
+                    self.video_progress.emit(i + 1, total)
                     continue
+                if skip:
+                    self.log.emit(f"  跳过 Step {','.join(sorted(skip))} (已完成)")
 
-                # Step 1: 媒体提取
-                if start_step <= 0:
-                    _t0 = __import__("time").time()
-                    self.step_start.emit("Step 1 媒体提取")
-                    self.log.emit(f"  Step 1 媒体提取...")
-                    audio_dir = os.path.join(project_dir, "audio")
-                    extract_audio(
-                        video_path, audio_dir,
-                        sample_rate=s.sample_rate,
-                        progress_cb=self._step_progress_cb(step_weights, i, total, 0),
-                    )
-                    fps = 1.0 / s.frame_interval if s.frame_interval > 0 else 1.0
-                    extract_frames(
-                        video_path, project_dir,
-                        fps=fps, resolution_scale=s.resolution_scale,
-                        progress_cb=self._step_progress_cb(step_weights, i, total, 0),
-                    )
-                    _dt = self._fmt_elapsed(__import__("time").time() - _t0)
-                    self.step_time.emit(f"Step 1: {_dt}")
-                    self.log.emit(f"  Step 1 完成 ({_dt})")
-                else:
-                    audio_dir = os.path.join(project_dir, "audio")
+                # GPU 占用检测
+                asr_uses_gpu = not (self.asr_data and self.asr_data.get("type") != "local")
+                vision_uses_gpu = (self.vision_config or {}).get("type", "ollama") == "ollama"
+                gpu_steps = set()
+                if asr_uses_gpu:
+                    gpu_steps.add("2")
+                if vision_uses_gpu:
+                    gpu_steps.add("4")
 
-                if self._cancel:
-                    break
-
-                # Step 2: 语音转录
-                if start_step <= 1:
-                    _t0 = __import__("time").time()
-                    self.step_start.emit("Step 2 语音转录")
-                    self.log.emit(f"  Step 2 语音转录...")
-                    mp3_files = list(Path(audio_dir).glob("*.mp3"))
-                    if not mp3_files:
-                        raise RuntimeError("未生成音频文件")
-                    audio_path = str(mp3_files[0])
-
-                    language = s.whisper_language if s.whisper_language else None
-                    vocabulary = s.vocabularies[0]["terms"] if s.vocabularies else None
-
-                    asr_type = "cloud" if self.asr_data and self.asr_data.get("type") != "local" else "local"
-                    if asr_type == "cloud":
-                        model = self.asr_data["model"]
-                        asr_api_url = self.asr_data.get("base_url", "")
-                        asr_api_key = self.asr_data.get("api_key", "")
-                        asr_api_type = self.asr_data.get("api_type", "whisper")
-                    else:
-                        model = self.asr_data.get("model", s.whisper_model) if self.asr_data else s.whisper_model
-                        asr_api_url = ""
-                        asr_api_key = ""
-                        asr_api_type = "whisper"
-
-                    transcribe(
-                        audio_path=audio_path,
-                        output_dir=project_dir,
-                        video_path=video_path,
-                        asr_type=asr_type,
-                        model=model,
-                        language=language,
-                        vocabulary=vocabulary,
-                        segment_length=s.segment_length,
-                        asr_api_url=asr_api_url,
-                        asr_api_key=asr_api_key,
-                        asr_cloud_model=model,
-                        asr_api_type=asr_api_type,
-                        progress_cb=self._step_progress_cb(step_weights, i, total, 1),
-                    )
-                    _dt = self._fmt_elapsed(__import__("time").time() - _t0)
-                    self.step_time.emit(f"Step 2: {_dt}")
-                    self.log.emit(f"  Step 2 完成 ({_dt})")
-
-                if self._cancel:
-                    break
-
-                # Step 3: 智能选帧
-                key_frames_dir = os.path.join(project_dir, "key_frames")
-                if start_step <= 2:
-                    _t0 = __import__("time").time()
-                    self.step_start.emit("Step 3 智能选帧")
-                    self.log.emit(f"  Step 3 智能选帧...")
-                    unified_path = os.path.join(project_dir, f"{name}.json")
-                    if os.path.exists(unified_path):
-                        transcript_path = unified_path
-                    else:
-                        transcript_path = os.path.join(project_dir, "transcript", "transcript.json")
-                    frames_dir = os.path.join(project_dir, "frames")
-                    select_result = select_frames(
-                        transcript_path, frames_dir, project_dir,
-                        self.select_provider,
-                        progress_cb=self._step_progress_cb(step_weights, i, total, 2),
-                    )
-                    _dt = self._fmt_elapsed(__import__("time").time() - _t0)
-                    self.step_time.emit(f"Step 3: {_dt}")
-                    self.log.emit(f"  Step 3 选出 {select_result['selected']} 帧 ({_dt})")
-                else:
-                    # Step 3 已跳过，直接检查 key_frames 目录
-                    key_frame_count = len(list(Path(key_frames_dir).glob("*.jpg"))) if os.path.isdir(key_frames_dir) else 0
-                    select_result = {"selected": key_frame_count, "total": 0}
-                    # 也需要 transcript_path 供 Step 4 使用
-                    unified_path = os.path.join(project_dir, f"{name}.json")
-                    transcript_path = unified_path if os.path.exists(unified_path) else os.path.join(project_dir, "transcript", "transcript.json")
-
-                if self._cancel:
-                    break
-
-                # Step 4: 图片理解（0 帧则跳过）
-                if start_step <= 3:
-                    has_slides = select_result['selected'] > 0 and os.path.exists(key_frames_dir) and list(Path(key_frames_dir).glob("*.jpg"))
-
-                    if has_slides:
-                        _t0 = __import__("time").time()
-                        self.step_start.emit("Step 4 图片理解")
-                        self.log.emit(f"  Step 4 图片理解...")
-                        vision_cfg = dict(self.vision_config) if self.vision_config else {}
-                        if not vision_cfg.get("url"):
-                            vision_cfg["url"] = s.ollama_url
-
-                        transcript_segments = []
-                        try:
-                            with open(transcript_path, "r", encoding="utf-8") as f:
-                                tdata = json.load(f)
-                            transcript_segments = tdata.get("segments", [])
-                        except Exception:
-                            pass
-
-                        prompts = {
-                            "ocr": s.vision_prompt_ocr,
-                            "diagram": s.vision_prompt_diagram,
-                            "title": s.vision_prompt_title,
-                            "single": s.vision_prompt_single,
-                        }
-
-                        unified_json = os.path.join(project_dir, f"{name}.json")
-                        analyze_images(
-                            key_frames_dir, project_dir, vision_cfg, prompts,
-                            progress_cb=self._step_progress_cb(step_weights, i, total, 3),
-                            transcript_segments=transcript_segments,
-                            unified_json_path=unified_json,
-                            max_concurrent=s.vision_concurrent,
-                        )
-                        _dt = self._fmt_elapsed(__import__("time").time() - _t0)
-                        self.step_time.emit(f"Step 4: {_dt}")
-                        self.log.emit(f"  Step 4 完成 ({_dt})")
-                    else:
-                        self.log.emit(f"  Step 4 跳过（无关键帧，仅使用转录）")
-
-                if self._cancel:
-                    break
-
-                # Step 5: AI 聚合
-                if start_step <= 4:
-                    _t0 = __import__("time").time()
-                    self.step_start.emit("Step 5 AI 聚合")
-                    self.log.emit(f"  Step 5 AI 聚合...")
-
-                    slides_text = ""
-                    transcript_text = ""
-                    unified_json = os.path.join(project_dir, f"{name}.json")
-                    if os.path.exists(unified_json):
-                        udata = json.loads(Path(unified_json).read_text(encoding="utf-8"))
-                        slides = udata.get("slides", [])
-                        segments = udata.get("segments", [])
-                        if slides:
-                            slides_text = json.dumps(slides, ensure_ascii=False, indent=2)
-                        if segments:
-                            transcript_text = json.dumps(segments, ensure_ascii=False, indent=2)
-
-                    if not slides_text:
-                        slides_path = os.path.join(project_dir, "slides.json")
-                        if os.path.exists(slides_path):
-                            slides_text = Path(slides_path).read_text(encoding="utf-8")
-                    if not transcript_text:
-                        old_transcript = os.path.join(project_dir, "transcript", "transcript.json")
-                        if os.path.exists(old_transcript):
-                            transcript_text = Path(old_transcript).read_text(encoding="utf-8")
-
-                    prompt = s.default_distill_prompt
-                    base_url = self.agg_provider.get("base_url", "").rstrip("/")
-                    api_key = self.agg_provider.get("api_key", "")
-                    agg_model = self.agg_provider.get("model", "")
-
-                    url = base_url + "/chat/completions"
-                    user_content = f"--- 幻灯片描述 ---\n{slides_text}\n\n--- 语音转录 ---\n{transcript_text}"
-                    payload = {
-                        "model": agg_model,
-                        "messages": [
-                            {"role": "system", "content": prompt},
-                            {"role": "user", "content": user_content},
-                        ],
-                        "max_tokens": 100000,
-                    }
-                    headers = {
-                        "Content-Type": "application/json",
-                        "Authorization": f"Bearer {api_key}",
-                    }
-                    resp = requests.post(url, json=payload, headers=headers, timeout=600)
-                    resp.raise_for_status()
-                    resp_data = resp.json()
-                    notes_text = resp_data["choices"][0]["message"]["content"].strip()
-                    finish_reason = resp_data["choices"][0].get("finish_reason", "")
-                    if finish_reason == "length":
-                        notes_text += "\n\n---\n> ⚠ 笔记被 max_tokens 截断，内容不完整。"
-
-                    notes_dir = os.path.join(project_dir, "notes")
-                    os.makedirs(notes_dir, exist_ok=True)
-                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    notes_path = os.path.join(notes_dir, f"{name}_{ts}.md")
-                    Path(notes_path).write_text(notes_text, encoding="utf-8")
-
-                    from src.chat import create_session
-                    create_session(project_dir, name, notes_path, self.agg_provider)
-
-                    _dt = self._fmt_elapsed(__import__("time").time() - _t0)
-                    self.step_time.emit(f"Step 5: {_dt}")
-                    self.log.emit(f"  ✓ {name} 笔记已生成 ({_dt})\n")
-                success += 1
+                self._run_dag(video_path, project_dir, name, i, total, skip, gpu_steps)
+                if not self._cancel:
+                    success += 1
 
             except Exception as e:
                 self.log.emit(f"  ✗ {name} 失败: {e}\n")
@@ -1926,6 +1781,335 @@ class _BatchWorker(QThread):
         if self._cancel:
             msg = f"已停止 — {msg}"
         self.finished.emit(not self._cancel, msg)
+
+    def _run_dag(self, video_path, project_dir, name, video_idx, total_videos, skip, gpu_steps):
+        """DAG 异步调度：就绪步骤并发执行"""
+        from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+
+        s = self.settings
+        completed = {}   # step_name → result
+        running = {}     # future → step_name
+        errors = {}      # step_name → error_msg
+
+        def deps_met(step):
+            deps = self._DAG[step][0]
+            return all(d in completed for d in deps) and not any(d in errors for d in deps)
+
+        def is_gpu_step(step):
+            return step in gpu_steps
+
+        def submit_ready(pool):
+            current_gpu = any(is_gpu_step(running[f]) for f in running)
+            for step in self._DAG:
+                if step in completed or step in errors:
+                    continue
+                if running and step in [running[f] for f in running]:
+                    continue
+                # 跳过已完成的步骤
+                step_num = step.rstrip("ab")
+                if step_num in skip:
+                    completed[step] = True
+                    continue
+                if not deps_met(step):
+                    continue
+                # GPU 互斥：同时最多一个 GPU 步骤
+                if is_gpu_step(step) and current_gpu:
+                    continue
+                fn_map = {
+                    "1a": self._do_step_1a,
+                    "1b": self._do_step_1b,
+                    "2":  self._do_step_2,
+                    "3":  self._do_step_3,
+                    "4":  self._do_step_4,
+                    "5":  self._do_step_5,
+                }
+                future = pool.submit(fn_map[step], video_path, project_dir, name,
+                                     video_idx, total_videos, completed)
+                running[future] = step
+                if is_gpu_step(step):
+                    current_gpu = True
+
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            submit_ready(pool)
+            while running:
+                if self._cancel:
+                    break
+                done, _ = wait(running.keys(), return_when=FIRST_COMPLETED)
+                for f in done:
+                    step = running.pop(f)
+                    try:
+                        result = f.result()
+                        completed[step] = result
+                    except Exception as e:
+                        errors[step] = str(e)
+                        label = self._DAG[step][2]
+                        self.log.emit(f"  ✗ {label} 失败: {e}")
+                submit_ready(pool)
+
+        if errors:
+            failed_steps = ", ".join(self._DAG[s][2] for s in errors)
+            raise RuntimeError(f"步骤失败: {failed_steps}")
+
+    # ─── DAG 各步骤实现 ───
+
+    def _do_step_1a(self, video_path, project_dir, name, vi, total, completed):
+        from src.media import extract_audio
+        _t0 = __import__("time").time()
+        self.step_start.emit("Step 1a 音频提取")
+        self.log.emit("  Step 1a 音频提取...")
+        audio_dir = os.path.join(project_dir, "audio")
+        extract_audio(
+            video_path, audio_dir,
+            sample_rate=self.settings.sample_rate,
+            progress_cb=lambda v: self.progress.emit(min(vi / total + 0.025 / total * v, 1.0)),
+        )
+        _dt = self._fmt_elapsed(__import__("time").time() - _t0)
+        self.step_time.emit(f"Step 1a: {_dt}")
+        self.log.emit(f"  Step 1a 完成 ({_dt})")
+        return True
+
+    def _do_step_1b(self, video_path, project_dir, name, vi, total, completed):
+        from src.media import extract_frames
+        s = self.settings
+        _t0 = __import__("time").time()
+        self.step_start.emit("Step 1b 帧提取")
+        self.log.emit("  Step 1b 帧提取...")
+        fps = 1.0 / s.frame_interval if s.frame_interval > 0 else 1.0
+        extract_frames(
+            video_path, project_dir,
+            fps=fps, resolution_scale=s.resolution_scale,
+            progress_cb=lambda v: self.progress.emit(min(vi / total + 0.025 / total * v, 1.0)),
+        )
+        _dt = self._fmt_elapsed(__import__("time").time() - _t0)
+        self.step_time.emit(f"Step 1b: {_dt}")
+        self.log.emit(f"  Step 1b 完成 ({_dt})")
+        return True
+
+    def _do_step_2(self, video_path, project_dir, name, vi, total, completed):
+        from src.transcribe import transcribe
+        s = self.settings
+        _t0 = __import__("time").time()
+        self.step_start.emit("Step 2 语音转录")
+        self.log.emit("  Step 2 语音转录...")
+
+        audio_dir = os.path.join(project_dir, "audio")
+        mp3_files = list(Path(audio_dir).glob("*.mp3"))
+        if not mp3_files:
+            raise RuntimeError("未生成音频文件")
+        audio_path = str(mp3_files[0])
+
+        language = s.whisper_language if s.whisper_language else None
+        vocabulary = s.vocabularies[0]["terms"] if s.vocabularies else None
+
+        asr_type = "cloud" if self.asr_data and self.asr_data.get("type") != "local" else "local"
+        if asr_type == "cloud":
+            model = self.asr_data["model"]
+            asr_api_url = self.asr_data.get("base_url", "")
+            asr_api_key = self.asr_data.get("api_key", "")
+            asr_api_type = self.asr_data.get("api_type", "whisper")
+        else:
+            model = self.asr_data.get("model", s.whisper_model) if self.asr_data else s.whisper_model
+            asr_api_url = ""
+            asr_api_key = ""
+            asr_api_type = "whisper"
+
+        transcribe(
+            audio_path=audio_path,
+            output_dir=project_dir,
+            video_path=video_path,
+            asr_type=asr_type,
+            model=model,
+            language=language,
+            vocabulary=vocabulary,
+            segment_length=s.segment_length,
+            asr_api_url=asr_api_url,
+            asr_api_key=asr_api_key,
+            asr_cloud_model=model,
+            asr_api_type=asr_api_type,
+            progress_cb=lambda v: self.progress.emit(min((vi + 0.05 + 0.15 * v) / total, 1.0)),
+        )
+        _dt = self._fmt_elapsed(__import__("time").time() - _t0)
+        self.step_time.emit(f"Step 2: {_dt}")
+        self.log.emit(f"  Step 2 完成 ({_dt})")
+
+        # 本地 Whisper 用完立即释放 GPU 显存，确保 Step 4 本地 Ollama 有空间加载
+        if asr_type == "local":
+            import gc
+            gc.collect()
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    self.log.emit("  GPU 显存已释放 (Whisper)")
+            except ImportError:
+                pass
+
+        return True
+
+    def _do_step_3(self, video_path, project_dir, name, vi, total, completed):
+        from src.frame_selector import select_frames
+        _t0 = __import__("time").time()
+        self.step_start.emit("Step 3 智能选帧")
+        self.log.emit("  Step 3 智能选帧...")
+
+        unified_path = os.path.join(project_dir, f"{name}.json")
+        if os.path.exists(unified_path):
+            transcript_path = unified_path
+        else:
+            transcript_path = os.path.join(project_dir, "transcript", "transcript.json")
+        frames_dir = os.path.join(project_dir, "frames")
+
+        select_result = select_frames(
+            transcript_path, frames_dir, project_dir,
+            self.select_provider,
+            progress_cb=lambda v: self.progress.emit(min((vi + 0.20 + 0.05 * v) / total, 1.0)),
+        )
+        _dt = self._fmt_elapsed(__import__("time").time() - _t0)
+        self.step_time.emit(f"Step 3: {_dt}")
+        self.log.emit(f"  Step 3 选出 {select_result['selected']} 帧 ({_dt})")
+        return select_result
+
+    def _do_step_4(self, video_path, project_dir, name, vi, total, completed):
+        import json
+        from src.image_analysis import analyze_images
+        s = self.settings
+
+        key_frames_dir = os.path.join(project_dir, "key_frames")
+        has_slides = (os.path.exists(key_frames_dir)
+                      and list(Path(key_frames_dir).glob("*.jpg")))
+        # 也检查 step 3 的结果
+        if "3" in completed and isinstance(completed["3"], dict):
+            has_slides = has_slides and completed["3"].get("selected", 0) > 0
+
+        if not has_slides:
+            self.log.emit("  Step 4 跳过（无关键帧，仅使用转录）")
+            return True
+
+        _t0 = __import__("time").time()
+        self.step_start.emit("Step 4 图片理解")
+        self.log.emit("  Step 4 图片理解...")
+
+        vision_cfg = dict(self.vision_config) if self.vision_config else {}
+        if not vision_cfg.get("url"):
+            vision_cfg["url"] = s.ollama_url
+
+        unified_path = os.path.join(project_dir, f"{name}.json")
+        if os.path.exists(unified_path):
+            transcript_path = unified_path
+        else:
+            transcript_path = os.path.join(project_dir, "transcript", "transcript.json")
+
+        transcript_segments = []
+        try:
+            with open(transcript_path, "r", encoding="utf-8") as f:
+                tdata = json.load(f)
+            transcript_segments = tdata.get("segments", [])
+        except Exception:
+            pass
+
+        prompts = {
+            "ocr": s.vision_prompt_ocr,
+            "diagram": s.vision_prompt_diagram,
+            "title": s.vision_prompt_title,
+            "single": s.vision_prompt_single,
+        }
+
+        analyze_images(
+            key_frames_dir, project_dir, vision_cfg, prompts,
+            progress_cb=lambda v: self.progress.emit(min((vi + 0.25 + 0.35 * v) / total, 1.0)),
+            transcript_segments=transcript_segments,
+            unified_json_path=os.path.join(project_dir, f"{name}.json"),
+            max_concurrent=s.vision_concurrent,
+        )
+        _dt = self._fmt_elapsed(__import__("time").time() - _t0)
+        self.step_time.emit(f"Step 4: {_dt}")
+        self.log.emit(f"  Step 4 完成 ({_dt})")
+        return True
+
+    def _do_step_5(self, video_path, project_dir, name, vi, total, completed):
+        import json, requests
+        s = self.settings
+        _t0 = __import__("time").time()
+        self.step_start.emit("Step 5 AI 聚合")
+        self.log.emit("  Step 5 AI 聚合...")
+
+        slides_text = ""
+        transcript_text = ""
+        slides_list = []
+        unified_json = os.path.join(project_dir, f"{name}.json")
+        if os.path.exists(unified_json):
+            udata = json.loads(Path(unified_json).read_text(encoding="utf-8"))
+            slides = udata.get("slides", [])
+            segments = udata.get("segments", [])
+            if slides:
+                slides_list = slides
+                slides_text = _format_slides_as_text(slides)
+            if segments:
+                transcript_text = json.dumps(segments, ensure_ascii=False, indent=2)
+
+        if not slides_text:
+            slides_path = os.path.join(project_dir, "slides.json")
+            if os.path.exists(slides_path):
+                raw = Path(slides_path).read_text(encoding="utf-8")
+                try:
+                    sdata = json.loads(raw)
+                    if isinstance(sdata, list):
+                        slides_list = sdata
+                        slides_text = _format_slides_as_text(sdata)
+                    elif "slides" in sdata:
+                        slides_list = sdata["slides"]
+                        slides_text = _format_slides_as_text(sdata["slides"])
+                    else:
+                        slides_text = raw
+                except json.JSONDecodeError:
+                    slides_text = raw
+        if not transcript_text:
+            old_transcript = os.path.join(project_dir, "transcript", "transcript.json")
+            if os.path.exists(old_transcript):
+                transcript_text = Path(old_transcript).read_text(encoding="utf-8")
+
+        prompt = s.default_distill_prompt
+        base_url = self.agg_provider.get("base_url", "").rstrip("/")
+        api_key = self.agg_provider.get("api_key", "")
+        agg_model = self.agg_provider.get("model", "")
+
+        url = base_url + "/chat/completions"
+        user_content = f"--- 幻灯片描述 ---\n{slides_text}\n\n--- 语音转录 ---\n{transcript_text}"
+        payload = {
+            "model": agg_model,
+            "messages": [
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": user_content},
+            ],
+            "max_tokens": 100000,
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        }
+        resp = requests.post(url, json=payload, headers=headers, timeout=600)
+        resp.raise_for_status()
+        resp_data = resp.json()
+        notes_text = resp_data["choices"][0]["message"]["content"].strip()
+        finish_reason = resp_data["choices"][0].get("finish_reason", "")
+        if slides_list:
+            notes_text = _fix_image_refs(notes_text, slides_list)
+        if finish_reason == "length":
+            notes_text += "\n\n---\n> ⚠ 笔记被 max_tokens 截断，内容不完整。"
+
+        notes_dir = os.path.join(project_dir, "notes")
+        os.makedirs(notes_dir, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        notes_path = os.path.join(notes_dir, f"{name}_{ts}.md")
+        Path(notes_path).write_text(notes_text, encoding="utf-8")
+
+        from src.chat import create_session
+        create_session(project_dir, name, notes_path, self.agg_provider)
+
+        _dt = self._fmt_elapsed(__import__("time").time() - _t0)
+        self.step_time.emit(f"Step 5: {_dt}")
+        self.log.emit(f"  ✓ {name} 笔记已生成 ({_dt})\n")
+        return True
 
 
 class _DropListWidget(QListWidget):

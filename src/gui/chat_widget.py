@@ -543,6 +543,13 @@ class ChatWidget(QWidget):
         bottom_row.addWidget(self.token_label)
         bottom_row.addStretch()
 
+        self.quick_btn = QPushButton("快捷提问")
+        self.quick_btn.setProperty("class", "chat-quick-btn")
+        self.quick_btn.setFixedWidth(80)
+        self.quick_btn.clicked.connect(self._show_quick_menu)
+        self.quick_btn.setStyleSheet("padding: 3px 6px;")
+        bottom_row.addWidget(self.quick_btn)
+
         self.model_combo = QComboBox()
         self.model_combo.setProperty("class", "chat-model-combo")
         self.model_combo.setFixedWidth(160)
@@ -931,6 +938,31 @@ class ChatWidget(QWidget):
                 self._on_send()
                 return True
         return super().eventFilter(obj, event)
+
+    def _show_quick_menu(self):
+        menu = QMenu(self)
+        from src.config import load_settings
+        questions = load_settings().quick_questions
+        for q in questions:
+            name = q.get("name", "")
+            text = q.get("text", "")
+            if name and text:
+                action = menu.addAction(name)
+                action.setData(text)
+        if menu.actions():
+            menu.triggered.connect(self._on_quick_question)
+            menu.exec(self.quick_btn.mapToGlobal(self.quick_btn.rect().bottomLeft()))
+
+    def _on_quick_question(self, action):
+        text = action.data()
+        if not text:
+            return
+        current = self.input_edit.toPlainText().strip()
+        if current:
+            self.input_edit.setPlainText(current + "\n" + text)
+        else:
+            self.input_edit.setPlainText(text)
+        self.input_edit.setFocus()
 
     def _on_send(self):
         if not self.session:
