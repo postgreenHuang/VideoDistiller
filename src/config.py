@@ -83,6 +83,7 @@ class Settings:
     frame_interval: float = 1.0  # 秒，每隔几秒截一帧
     ssim_threshold: float = 0.95
     whisper_model: str = "large-v3"
+    whisper_batch_size: int = 16
     whisper_language: str = ""
     segment_length: int = 180
     asr_type: str = "local"  # "local" | "cloud"

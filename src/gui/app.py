@@ -101,6 +101,29 @@ class MainWindow(QMainWindow):
         self._update_dynamic_colors()
         self._force_qt_combobox()
 
+    def closeEvent(self, event):
+        """确保所有后台线程在退出前正确停止"""
+        workers = [
+            getattr(self, '_batch_worker', None),
+            getattr(self, '_generate_worker', None),
+            getattr(self, '_audio_worker', None),
+            getattr(self, '_frame_worker', None),
+            getattr(self, '_frame_select_worker', None),
+            getattr(self, '_vision_worker', None),
+            getattr(self, '_transcribe_worker', None),
+        ]
+        for w in workers:
+            if w is None:
+                continue
+            if hasattr(w, '_cancel'):
+                w._cancel = True
+            if hasattr(w, '_cancel_flag'):
+                w._cancel_flag["cancel"] = True
+        for w in workers:
+            if w is not None and hasattr(w, 'isRunning') and w.isRunning():
+                w.wait(3000)
+        event.accept()
+
     def _update_dynamic_colors(self):
         pass
 
@@ -498,6 +521,8 @@ class MainWindow(QMainWindow):
         if hasattr(self, '_batch_worker') and self._batch_worker:
             self._batch_worker._cancel = True
             self.batch_log.append("\n正在停止...")
+            self.btn_batch_start.setEnabled(False)
+            self.btn_batch_start.setText("正在停止...")
 
     def _batch_on_log(self, msg: str):
         self.batch_log.append(msg)
@@ -529,8 +554,13 @@ class MainWindow(QMainWindow):
     def _batch_on_done(self, ok: bool, msg: str):
         self._batch_step_timer.stop()
         self.batch_step_timer_label.setText(" ")
+        # 安全恢复按钮状态
+        try:
+            self.btn_batch_start.clicked.disconnect()
+        except RuntimeError:
+            pass
         self.btn_batch_start.setText("开始批量蒸馏")
-        self.btn_batch_start.clicked.disconnect()
+        self.btn_batch_start.setEnabled(True)
         self.btn_batch_start.clicked.connect(self._batch_start)
         self.batch_progress.setValue(100 if ok else self.batch_progress.value())
         failed_videos = self._batch_worker._failed_videos if self._batch_worker else []
@@ -1400,6 +1430,7 @@ class MainWindow(QMainWindow):
             asr_api_url, asr_api_key, asr_api_type,
             progress_cb=lambda v: self.transcribe_progress.setValue(int(v * 100)),
             video_path=self.video_path_edit.text().strip(),
+            batch_size=s.whisper_batch_size,
         )
         self._transcribe_worker.progress.connect(lambda v: self.transcribe_progress.setValue(int(v * 100)))
         self._transcribe_worker.finished.connect(self._on_transcribe_done)
@@ -1492,7 +1523,8 @@ class _TranscribeWorker(QThread):
 
     def __init__(self, audio_path, project_dir, asr_type, model, language,
                  vocabulary, segment_length, asr_api_url, asr_api_key,
-                 asr_api_type="whisper", progress_cb=None, video_path=""):
+                 asr_api_type="whisper", progress_cb=None, video_path="",
+                 batch_size=16):
         super().__init__()
         self.audio_path = audio_path
         self.project_dir = project_dir
@@ -1507,6 +1539,7 @@ class _TranscribeWorker(QThread):
         self.result = None
         self._progress_cb = progress_cb
         self.video_path = video_path
+        self.batch_size = batch_size
 
     def run(self):
         from src.transcribe import transcribe
@@ -1525,6 +1558,7 @@ class _TranscribeWorker(QThread):
                 asr_cloud_model=self.model,
                 asr_api_type=self.asr_api_type,
                 progress_cb=lambda v: self.progress.emit(v),
+                batch_size=self.batch_size,
             )
             self.finished.emit(True, "")
         except Exception as e:
@@ -1682,7 +1716,7 @@ class _BatchWorker(QThread):
     progress = Signal(float)
     video_progress = Signal(int, int)
     log = Signal(str)
-    step_time = Signal(str)       # "Step N 耗时 Xm Xs"
+    step_time = Signal(str)       # "[视频名] Step N 耗时 Xm Xs"
     step_start = Signal(str)      # 当前步骤名称，用于实时计时
     finished = Signal(bool, str)
 
@@ -1706,74 +1740,101 @@ class _BatchWorker(QThread):
             return f"{s}s"
         return f"{s // 60}m {s % 60:02d}s"
 
-    # ─── DAG 步骤定义 ───
+    # ─── 单视频 DAG 定义 ───
 
-    # 步骤名 → (依赖列表, 是否用 GPU, 日志标签)
-    # GPU 互斥：同时最多 1 个 GPU 步骤（本地 Whisper 和本地 Ollama 共享 3090 VRAM）
-    # Step 4 显式依赖 Step 2：即使 3 先完成，也必须等 2 结束并释放显存后才能启动
-    _DAG = {
-        "1a": ([],                       False, "Step 1a 音频提取"),
-        "1b": ([],                       False, "Step 1b 帧提取"),
-        "2":  (["1a"],                   None,  "Step 2 语音转录"),   # None=运行时判断
-        "3":  (["1b", "2"],              False, "Step 3 智能选帧"),
-        "4":  (["3", "2"],               None,  "Step 4 图片理解"),   # 显式依赖 2
-        "5":  (["4"],                    False, "Step 5 AI 聚合"),
+    _STEP_DAG = {
+        "1a": ([],         "Step 1a 音频提取"),
+        "1b": ([],         "Step 1b 帧提取"),
+        "2":  (["1a"],     "Step 2 语音转录"),
+        "3":  (["1b", "2"],"Step 3 智能选帧"),
+        "4":  (["3", "2"], "Step 4 图片理解"),
+        "5":  (["4"],      "Step 5 AI 聚合"),
     }
 
     def run(self):
-        import json, requests
+        from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
         from src.config import get_project_dir
         from src.pipeline import get_completed_steps
 
-        s = self.settings
         total = len(self.videos)
         success = 0
         failed = 0
 
+        # ─── 收集视频信息 ───
+        self.log.emit(f"准备批量蒸馏: {total} 个视频\n")
+        # tasks: [(vi, name, video_path, project_dir, skip_set), ...]
+        tasks = []
         for i, video_path in enumerate(self.videos):
             if self._cancel:
                 break
-
             name = Path(video_path).stem
-            self.log.emit(f"── [{i+1}/{total}] {name} ──")
-
             try:
                 project_dir = str(get_project_dir(self.output_dir, video_path))
-
-                # 检测已完成步骤，计算跳过集
                 completed_steps = get_completed_steps(project_dir)
                 skip = set()
                 for si, ok in enumerate(completed_steps):
                     if not ok:
                         break
-                    skip.add(str(si + 1))  # "1","2","3","4","5"
+                    skip.add(str(si + 1))
                 if all(completed_steps):
-                    self.log.emit(f"  ✓ {name} 已全部完成，跳过\n")
+                    self.log.emit(f"[{name}] 已全部完成，跳过")
                     success += 1
                     self.video_progress.emit(i + 1, total)
                     continue
                 if skip:
-                    self.log.emit(f"  跳过 Step {','.join(sorted(skip))} (已完成)")
-
-                # GPU 占用检测
-                asr_uses_gpu = not (self.asr_data and self.asr_data.get("type") != "local")
-                vision_uses_gpu = (self.vision_config or {}).get("type", "ollama") == "ollama"
-                gpu_steps = set()
-                if asr_uses_gpu:
-                    gpu_steps.add("2")
-                if vision_uses_gpu:
-                    gpu_steps.add("4")
-
-                self._run_dag(video_path, project_dir, name, i, total, skip, gpu_steps)
-                if not self._cancel:
-                    success += 1
-
+                    self.log.emit(f"[{name}] 跳过 Step {','.join(sorted(skip))} (已完成)")
+                tasks.append((i, name, video_path, project_dir, skip))
             except Exception as e:
-                self.log.emit(f"  ✗ {name} 失败: {e}\n")
+                self.log.emit(f"[{name}] 初始化失败: {e}")
                 failed += 1
                 self._failed_videos.append(video_path)
+                self.video_progress.emit(i + 1, total)
 
-            self.video_progress.emit(i + 1, total)
+        # ─── 阶段一：Step 1 并行提取所有视频的媒体 ───
+        need_step1 = [t for t in tasks if "1" not in t[4]]
+        step1_ok = set()
+        if need_step1 and not self._cancel:
+            self.log.emit(f"阶段一：并行媒体提取 ({len(need_step1)} 个视频)")
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                futures = {}
+                for vi, name, vpath, pdir, _skip in need_step1:
+                    f = pool.submit(self._do_step_1_full, vpath, pdir, name, vi, total)
+                    futures[f] = (vi, name)
+                while futures:
+                    if self._cancel:
+                        break
+                    done, _ = wait(futures.keys(), return_when=FIRST_COMPLETED)
+                    for f in done:
+                        vi, vname = futures.pop(f)
+                        try:
+                            f.result()
+                            step1_ok.add(vi)
+                        except Exception as e:
+                            self.log.emit(f"[{vname}] ✗ Step 1 失败: {e}")
+                            failed += 1
+                            self._failed_videos.append(self.videos[vi])
+                            self.video_progress.emit(success + failed, total)
+
+        # ─── 阶段二：Step 2-5 逐视频串行处理 ───
+        if tasks:
+            self.log.emit(f"\n阶段二：逐视频处理 Step 2-5")
+        for vi, name, vpath, pdir, skip in tasks:
+            if self._cancel:
+                break
+            # Step 1 需要但没成功的，跳过
+            if "1" not in skip and vi not in step1_ok:
+                continue
+
+            try:
+                self._run_video_dag(vpath, pdir, name, vi, total, skip)
+                if not self._cancel:
+                    success += 1
+            except Exception as e:
+                self.log.emit(f"[{name}] ✗ 失败: {e}\n")
+                failed += 1
+                self._failed_videos.append(vpath)
+
+            self.video_progress.emit(success + failed, total)
 
         msg = f"完成 {success}/{total}"
         if failed:
@@ -1782,51 +1843,65 @@ class _BatchWorker(QThread):
             msg = f"已停止 — {msg}"
         self.finished.emit(not self._cancel, msg)
 
-    def _run_dag(self, video_path, project_dir, name, video_idx, total_videos, skip, gpu_steps):
-        """DAG 异步调度：就绪步骤并发执行"""
+    def _do_step_1_full(self, video_path, project_dir, name, vi, total):
+        """执行完整的 Step 1（音频 + 帧提取），用于并行阶段"""
+        self._do_step_1a(video_path, project_dir, name, vi, total, {}, name)
+        self._do_step_1b(video_path, project_dir, name, vi, total, {}, name)
+
+    def _run_video_dag(self, video_path, project_dir, name, vi, total, skip):
+        """单个视频的 Step 2-5 DAG 调度（步骤内并发）"""
         from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
-        s = self.settings
-        completed = {}   # step_name → result
-        running = {}     # future → step_name
-        errors = {}      # step_name → error_msg
+        completed = {}
+        running = {}
+        errors = {}
+
+        # GPU 互斥检测
+        asr_uses_gpu = not (self.asr_data and self.asr_data.get("type") != "local")
+        vision_uses_gpu = (self.vision_config or {}).get("type", "ollama") == "ollama"
+        gpu_steps = set()
+        if asr_uses_gpu:
+            gpu_steps.add("2")
+        if vision_uses_gpu:
+            gpu_steps.add("4")
 
         def deps_met(step):
-            deps = self._DAG[step][0]
+            deps = self._STEP_DAG[step][0]
             return all(d in completed for d in deps) and not any(d in errors for d in deps)
 
-        def is_gpu_step(step):
-            return step in gpu_steps
-
         def submit_ready(pool):
-            current_gpu = any(is_gpu_step(running[f]) for f in running)
-            for step in self._DAG:
+            current_gpu = any(running.get(f) in gpu_steps for f in running)
+            for step in self._STEP_DAG:
                 if step in completed or step in errors:
                     continue
-                if running and step in [running[f] for f in running]:
+                if step in [running[f] for f in running]:
                     continue
-                # 跳过已完成的步骤
                 step_num = step.rstrip("ab")
                 if step_num in skip:
                     completed[step] = True
                     continue
+                # Step 1 已在阶段一完成，直接标记
+                if step in ("1a", "1b"):
+                    completed[step] = True
+                    continue
                 if not deps_met(step):
                     continue
-                # GPU 互斥：同时最多一个 GPU 步骤
-                if is_gpu_step(step) and current_gpu:
+                if step in gpu_steps and current_gpu:
                     continue
                 fn_map = {
-                    "1a": self._do_step_1a,
-                    "1b": self._do_step_1b,
                     "2":  self._do_step_2,
                     "3":  self._do_step_3,
                     "4":  self._do_step_4,
                     "5":  self._do_step_5,
                 }
-                future = pool.submit(fn_map[step], video_path, project_dir, name,
-                                     video_idx, total_videos, completed)
+                if step not in fn_map:
+                    continue
+                future = pool.submit(
+                    fn_map[step], video_path, project_dir, name,
+                    vi, total, completed, name,
+                )
                 running[future] = step
-                if is_gpu_step(step):
+                if step in gpu_steps:
                     current_gpu = True
 
         with ThreadPoolExecutor(max_workers=3) as pool:
@@ -1837,26 +1912,28 @@ class _BatchWorker(QThread):
                 done, _ = wait(running.keys(), return_when=FIRST_COMPLETED)
                 for f in done:
                     step = running.pop(f)
+                    label = self._STEP_DAG[step][1]
                     try:
                         result = f.result()
                         completed[step] = result
                     except Exception as e:
                         errors[step] = str(e)
-                        label = self._DAG[step][2]
-                        self.log.emit(f"  ✗ {label} 失败: {e}")
+                        self.log.emit(f"[{name}] ✗ {label} 失败: {e}")
                 submit_ready(pool)
 
         if errors:
-            failed_steps = ", ".join(self._DAG[s][2] for s in errors)
+            failed_steps = ", ".join(self._STEP_DAG[s][1] for s in errors)
             raise RuntimeError(f"步骤失败: {failed_steps}")
 
     # ─── DAG 各步骤实现 ───
 
-    def _do_step_1a(self, video_path, project_dir, name, vi, total, completed):
+    def _do_step_1a(self, video_path, project_dir, name, vi, total, completed, vname):
+        if self._cancel:
+            raise RuntimeError("已取消")
         from src.media import extract_audio
         _t0 = __import__("time").time()
-        self.step_start.emit("Step 1a 音频提取")
-        self.log.emit("  Step 1a 音频提取...")
+        self.step_start.emit(f"[{vname}] Step 1a 音频提取")
+        self.log.emit(f"[{vname}] Step 1a 音频提取...")
         audio_dir = os.path.join(project_dir, "audio")
         extract_audio(
             video_path, audio_dir,
@@ -1864,16 +1941,18 @@ class _BatchWorker(QThread):
             progress_cb=lambda v: self.progress.emit(min(vi / total + 0.025 / total * v, 1.0)),
         )
         _dt = self._fmt_elapsed(__import__("time").time() - _t0)
-        self.step_time.emit(f"Step 1a: {_dt}")
-        self.log.emit(f"  Step 1a 完成 ({_dt})")
+        self.step_time.emit(f"[{vname}] Step 1a: {_dt}")
+        self.log.emit(f"[{vname}] Step 1a 完成 ({_dt})")
         return True
 
-    def _do_step_1b(self, video_path, project_dir, name, vi, total, completed):
+    def _do_step_1b(self, video_path, project_dir, name, vi, total, completed, vname):
+        if self._cancel:
+            raise RuntimeError("已取消")
         from src.media import extract_frames
         s = self.settings
         _t0 = __import__("time").time()
-        self.step_start.emit("Step 1b 帧提取")
-        self.log.emit("  Step 1b 帧提取...")
+        self.step_start.emit(f"[{vname}] Step 1b 帧提取")
+        self.log.emit(f"[{vname}] Step 1b 帧提取...")
         fps = 1.0 / s.frame_interval if s.frame_interval > 0 else 1.0
         extract_frames(
             video_path, project_dir,
@@ -1881,16 +1960,18 @@ class _BatchWorker(QThread):
             progress_cb=lambda v: self.progress.emit(min(vi / total + 0.025 / total * v, 1.0)),
         )
         _dt = self._fmt_elapsed(__import__("time").time() - _t0)
-        self.step_time.emit(f"Step 1b: {_dt}")
-        self.log.emit(f"  Step 1b 完成 ({_dt})")
+        self.step_time.emit(f"[{vname}] Step 1b: {_dt}")
+        self.log.emit(f"[{vname}] Step 1b 完成 ({_dt})")
         return True
 
-    def _do_step_2(self, video_path, project_dir, name, vi, total, completed):
+    def _do_step_2(self, video_path, project_dir, name, vi, total, completed, vname):
+        if self._cancel:
+            raise RuntimeError("已取消")
         from src.transcribe import transcribe
         s = self.settings
         _t0 = __import__("time").time()
-        self.step_start.emit("Step 2 语音转录")
-        self.log.emit("  Step 2 语音转录...")
+        self.step_start.emit(f"[{vname}] Step 2 语音转录")
+        self.log.emit(f"[{vname}] Step 2 语音转录...")
 
         audio_dir = os.path.join(project_dir, "audio")
         mp3_files = list(Path(audio_dir).glob("*.mp3"))
@@ -1913,6 +1994,15 @@ class _BatchWorker(QThread):
             asr_api_key = ""
             asr_api_type = "whisper"
 
+        _last_pct = [0]
+
+        def _step2_progress(v):
+            self.progress.emit(min((vi + 0.05 + 0.15 * v) / total, 1.0))
+            pct = int(v * 100)
+            if pct >= _last_pct[0] + 10:
+                _last_pct[0] = pct
+                self.log.emit(f"[{vname}] Step 2 转录 {pct}%")
+
         transcribe(
             audio_path=audio_path,
             output_dir=project_dir,
@@ -1926,11 +2016,12 @@ class _BatchWorker(QThread):
             asr_api_key=asr_api_key,
             asr_cloud_model=model,
             asr_api_type=asr_api_type,
-            progress_cb=lambda v: self.progress.emit(min((vi + 0.05 + 0.15 * v) / total, 1.0)),
+            progress_cb=_step2_progress,
+            batch_size=s.whisper_batch_size,
         )
         _dt = self._fmt_elapsed(__import__("time").time() - _t0)
-        self.step_time.emit(f"Step 2: {_dt}")
-        self.log.emit(f"  Step 2 完成 ({_dt})")
+        self.step_time.emit(f"[{vname}] Step 2: {_dt}")
+        self.log.emit(f"[{vname}] Step 2 完成 ({_dt})")
 
         # 本地 Whisper 用完立即释放 GPU 显存，确保 Step 4 本地 Ollama 有空间加载
         if asr_type == "local":
@@ -1940,17 +2031,19 @@ class _BatchWorker(QThread):
                 import torch
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
-                    self.log.emit("  GPU 显存已释放 (Whisper)")
+                    self.log.emit(f"[{vname}] GPU 显存已释放 (Whisper)")
             except ImportError:
                 pass
 
         return True
 
-    def _do_step_3(self, video_path, project_dir, name, vi, total, completed):
+    def _do_step_3(self, video_path, project_dir, name, vi, total, completed, vname):
+        if self._cancel:
+            raise RuntimeError("已取消")
         from src.frame_selector import select_frames
         _t0 = __import__("time").time()
-        self.step_start.emit("Step 3 智能选帧")
-        self.log.emit("  Step 3 智能选帧...")
+        self.step_start.emit(f"[{vname}] Step 3 智能选帧")
+        self.log.emit(f"[{vname}] Step 3 智能选帧...")
 
         unified_path = os.path.join(project_dir, f"{name}.json")
         if os.path.exists(unified_path):
@@ -1965,11 +2058,13 @@ class _BatchWorker(QThread):
             progress_cb=lambda v: self.progress.emit(min((vi + 0.20 + 0.05 * v) / total, 1.0)),
         )
         _dt = self._fmt_elapsed(__import__("time").time() - _t0)
-        self.step_time.emit(f"Step 3: {_dt}")
-        self.log.emit(f"  Step 3 选出 {select_result['selected']} 帧 ({_dt})")
+        self.step_time.emit(f"[{vname}] Step 3: {_dt}")
+        self.log.emit(f"[{vname}] Step 3 选出 {select_result['selected']} 帧 ({_dt})")
         return select_result
 
-    def _do_step_4(self, video_path, project_dir, name, vi, total, completed):
+    def _do_step_4(self, video_path, project_dir, name, vi, total, completed, vname):
+        if self._cancel:
+            raise RuntimeError("已取消")
         import json
         from src.image_analysis import analyze_images
         s = self.settings
@@ -1978,16 +2073,17 @@ class _BatchWorker(QThread):
         has_slides = (os.path.exists(key_frames_dir)
                       and list(Path(key_frames_dir).glob("*.jpg")))
         # 也检查 step 3 的结果
-        if "3" in completed and isinstance(completed["3"], dict):
-            has_slides = has_slides and completed["3"].get("selected", 0) > 0
+        step3_key = f"{vi}:3"
+        if step3_key in completed and isinstance(completed[step3_key], dict):
+            has_slides = has_slides and completed[step3_key].get("selected", 0) > 0
 
         if not has_slides:
-            self.log.emit("  Step 4 跳过（无关键帧，仅使用转录）")
+            self.log.emit(f"[{vname}] Step 4 跳过（无关键帧，仅使用转录）")
             return True
 
         _t0 = __import__("time").time()
-        self.step_start.emit("Step 4 图片理解")
-        self.log.emit("  Step 4 图片理解...")
+        self.step_start.emit(f"[{vname}] Step 4 图片理解")
+        self.log.emit(f"[{vname}] Step 4 图片理解...")
 
         vision_cfg = dict(self.vision_config) if self.vision_config else {}
         if not vision_cfg.get("url"):
@@ -2022,16 +2118,18 @@ class _BatchWorker(QThread):
             max_concurrent=s.vision_concurrent,
         )
         _dt = self._fmt_elapsed(__import__("time").time() - _t0)
-        self.step_time.emit(f"Step 4: {_dt}")
-        self.log.emit(f"  Step 4 完成 ({_dt})")
+        self.step_time.emit(f"[{vname}] Step 4: {_dt}")
+        self.log.emit(f"[{vname}] Step 4 完成 ({_dt})")
         return True
 
-    def _do_step_5(self, video_path, project_dir, name, vi, total, completed):
+    def _do_step_5(self, video_path, project_dir, name, vi, total, completed, vname):
+        if self._cancel:
+            raise RuntimeError("已取消")
         import json, requests
         s = self.settings
         _t0 = __import__("time").time()
-        self.step_start.emit("Step 5 AI 聚合")
-        self.log.emit("  Step 5 AI 聚合...")
+        self.step_start.emit(f"[{vname}] Step 5 AI 聚合")
+        self.log.emit(f"[{vname}] Step 5 AI 聚合...")
 
         slides_text = ""
         transcript_text = ""
@@ -2107,8 +2205,8 @@ class _BatchWorker(QThread):
         create_session(project_dir, name, notes_path, self.agg_provider)
 
         _dt = self._fmt_elapsed(__import__("time").time() - _t0)
-        self.step_time.emit(f"Step 5: {_dt}")
-        self.log.emit(f"  ✓ {name} 笔记已生成 ({_dt})\n")
+        self.step_time.emit(f"[{vname}] Step 5: {_dt}")
+        self.log.emit(f"[{vname}] ✓ 笔记已生成 ({_dt})\n")
         return True
 
 

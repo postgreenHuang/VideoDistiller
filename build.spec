@@ -11,25 +11,23 @@ a = Analysis(
         'scipy.special._ufuncs',
         'scipy.special._specfun',
         'scipy.special._comb',
+        'scipy.stats._distn_infrastructure',
         'skimage',
         'skimage.metrics',
     ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=['nltk', 'scipy.stats.distributions'],
     noarchive=False,
 )
 
 # faster-whisper runtime files
 from PyInstaller.utils.hooks import collect_all
-for item in collect_all('faster_whisper'):
-    if isinstance(item, tuple) and len(item) == 3:
-        typ = item[2]
-        if typ == 'DATA':
-            a.datas += [item]
-        elif typ == 'BINARY':
-            a.binaries += [item]
+fw_datas, fw_binaries, fw_hiddenimports = collect_all('faster_whisper')
+a.datas += fw_datas
+a.binaries += fw_binaries
+a.hiddenimports += fw_hiddenimports
 
 pyz = PYZ(a.pure)
 

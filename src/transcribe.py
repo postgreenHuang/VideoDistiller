@@ -95,116 +95,7 @@ def _enrich_segments(segments: list[dict]) -> list[dict]:
     return segments
 
 
-# ─── 本地 faster-whisper（子进程隔离 CUDA） ───
-
-_LOCAL_CHUNK_SECONDS = 180  # 3 分钟一个切片（large-v3 + CUDA 安全上限）
-
-
-def _call_whisper_subprocess(
-    audio_path: str,
-    model_name: str = "large-v3",
-    language: Optional[str] = None,
-    initial_prompt: Optional[str] = None,
-    time_offset: float = 0.0,
-    progress_cb: Optional[Callable[[float], None]] = None,
-    total_chunks: int = 1,
-    chunk_idx: int = 0,
-    _retry_count: int = 0,
-) -> list[dict]:
-    """在独立子进程中运行 Whisper，通过临时文件传递进度和结果"""
-    import tempfile
-    import time as _time
-
-    result_path = os.path.join(tempfile.gettempdir(), f"whisper_result_{os.getpid()}_{chunk_idx}.json")
-    progress_path = os.path.join(tempfile.gettempdir(), f"whisper_prog_{os.getpid()}_{chunk_idx}.json")
-    for p in (result_path, progress_path):
-        if os.path.exists(p):
-            os.unlink(p)
-
-    worker_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_whisper_worker.py")
-    cmd = [sys.executable, worker_script,
-           "--audio", audio_path,
-           "--model", model_name,
-           "--result", result_path,
-           "--progress", progress_path]
-    if language and language != "auto":
-        cmd.extend(["--language", language])
-    if initial_prompt:
-        cmd.extend(["--prompt", initial_prompt])
-
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-    )
-
-    last_progress = 0.0
-    while proc.poll() is None:
-        if os.path.exists(progress_path):
-            try:
-                with open(progress_path, "r") as f:
-                    p = float(f.read().strip())
-                if p > last_progress:
-                    last_progress = p
-                    if progress_cb and total_chunks > 1:
-                        progress_cb((chunk_idx + p) / total_chunks)
-                    elif progress_cb:
-                        progress_cb(p)
-            except Exception:
-                pass
-        _time.sleep(0.5)
-
-    if proc.returncode != 0:
-        for p in (result_path, progress_path):
-            try:
-                os.unlink(p)
-            except Exception:
-                pass
-
-        # 崩溃重试：把当前 chunk 对半切开，递归处理（最多重试 2 次）
-        if _retry_count < 2:
-            duration = _get_audio_duration(audio_path)
-            if duration > 30:
-                import tempfile as _tf
-                half = duration / 2
-                all_segs = []
-                with _tf.TemporaryDirectory() as tmp:
-                    chunks = _split_audio_chunks(audio_path, int(half), tmp)
-                    for ci, (cp, off) in enumerate(chunks):
-                        segs = _call_whisper_subprocess(
-                            cp, model_name, language, initial_prompt,
-                            time_offset=time_offset + off, progress_cb=None,
-                            _retry_count=_retry_count + 1,
-                        )
-                        all_segs.extend(segs)
-                return all_segs
-
-        stderr = proc.stderr.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Whisper 进程崩溃 (exit {proc.returncode}): {stderr[:500]}")
-
-    if not os.path.exists(result_path):
-        for p in (result_path, progress_path):
-            try:
-                os.unlink(p)
-            except Exception:
-                pass
-        raise RuntimeError("Whisper 进程结束但未生成结果文件")
-
-    with open(result_path, "r", encoding="utf-8") as f:
-        raw_segments = json.load(f)
-
-    for seg in raw_segments:
-        seg["start"] = round(seg["start"] + time_offset, 2)
-        seg["end"] = round(seg["end"] + time_offset, 2)
-
-    for p in (result_path, progress_path):
-        try:
-            os.unlink(p)
-        except Exception:
-            pass
-
-    return raw_segments
+# ─── 本地 faster-whisper（BatchedInferencePipeline） ───
 
 
 def _transcribe_local(
@@ -214,59 +105,52 @@ def _transcribe_local(
     initial_prompt: Optional[str] = None,
     segment_length: int = 180,
     progress_cb: Optional[Callable[[float], None]] = None,
-    max_workers: int = 2,
+    batch_size: int = 16,
 ) -> list[dict]:
-    duration = _get_audio_duration(audio_path)
+    from faster_whisper import WhisperModel, BatchedInferencePipeline
 
-    if duration <= 0 or duration <= _LOCAL_CHUNK_SECONDS:
-        raw_segments = _call_whisper_subprocess(
-            audio_path, model_name, language, initial_prompt,
-            time_offset=0.0, progress_cb=progress_cb,
-            total_chunks=1, chunk_idx=0,
-        )
-    else:
-        import tempfile
-        import threading
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+    try:
+        import torch
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    except ImportError:
+        device = "cpu"
+    compute = "float16" if device == "cuda" else "int8"
 
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            chunks = _split_audio_chunks(audio_path, _LOCAL_CHUNK_SECONDS, tmp_dir)
-            n = len(chunks)
-            chunk_progress = [0.0] * n
-            plock = threading.Lock()
+    model = WhisperModel(model_name, device=device, compute_type=compute)
+    pipeline = BatchedInferencePipeline(model=model)
 
-            def _chunk_progress_cb(idx, total, cb):
-                if not cb:
-                    return lambda v: None
-                def cb_wrapper(v):
-                    with plock:
-                        chunk_progress[idx] = v
-                        overall = sum(chunk_progress) / total
-                        cb(overall)
-                return cb_wrapper
+    lang = language if language and language != "auto" else None
+    prompt = initial_prompt if initial_prompt else None
 
-            raw_segments = []
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = {}
-                for i, (chunk_path, offset) in enumerate(chunks):
-                    f = executor.submit(
-                        _call_whisper_subprocess,
-                        chunk_path, model_name, language, initial_prompt,
-                        offset, _chunk_progress_cb(i, n, progress_cb),
-                    )
-                    futures[f] = i
+    segments_iter, info = pipeline.transcribe(
+        audio_path,
+        language=lang,
+        initial_prompt=prompt,
+        batch_size=batch_size,
+        condition_on_previous_text=True,
+        vad_filter=True,
+    )
 
-                for f in as_completed(futures):
-                    idx = futures[f]
-                    try:
-                        segs = f.result()
-                        raw_segments.extend(segs)
-                    except Exception as e:
-                        raise RuntimeError(f"Chunk {idx} 转录失败: {e}")
+    raw_segments = []
+    total_duration = info.duration
+    for seg in segments_iter:
+        raw_segments.append({
+            "start": round(seg.start, 2),
+            "end": round(seg.end, 2),
+            "text": seg.text.strip(),
+        })
+        if progress_cb and total_duration > 0:
+            progress_cb(min(seg.end / total_duration, 1.0))
 
-            # 按时间排序（并发结果顺序不确定）
-            raw_segments.sort(key=lambda s: s["start"])
+    del pipeline, model
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except ImportError:
+        pass
 
+    raw_segments.sort(key=lambda s: s["start"])
     merged = _merge_segments(raw_segments, segment_length)
     return _enrich_segments(merged)
 
@@ -514,6 +398,7 @@ def transcribe(
     asr_cloud_model: str = "whisper-large-v3",
     asr_api_type: str = "whisper",
     progress_cb: Optional[Callable[[float], None]] = None,
+    batch_size: int = 16,
 ) -> dict:
     if asr_type == "cloud":
         if asr_api_type == "dashscope":
@@ -535,6 +420,7 @@ def transcribe(
     else:
         segments = _transcribe_local(
             audio_path, model, language, vocabulary, segment_length, progress_cb,
+            batch_size=batch_size,
         )
         used_model = model
 

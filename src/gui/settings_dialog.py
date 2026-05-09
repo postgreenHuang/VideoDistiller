@@ -386,6 +386,13 @@ class SettingsDialog(QDialog):
         self.whisper_combo.addItems(WHISPER_MODELS)
         mode_l.addWidget(self.whisper_combo, 1, 1)
 
+        mode_l.addWidget(QLabel("批处理大小:"), 2, 0)
+        self.batch_size_spin = QSpinBox()
+        self.batch_size_spin.setRange(1, 64)
+        self.batch_size_spin.setValue(16)
+        self.batch_size_spin.setToolTip("batch_size 越大并行度越高，显存占用越大\nRTX 3090 推荐 16-32")
+        mode_l.addWidget(self.batch_size_spin, 2, 1)
+
         layout.addWidget(mode_g)
 
         # 云端 ASR 配置 (卡片式)
@@ -877,6 +884,7 @@ class SettingsDialog(QDialog):
         # 语音识别
         self.asr_type_combo.setCurrentIndex(0 if s.asr_type == "local" else 1)
         self.whisper_combo.setCurrentText(s.whisper_model)
+        self.batch_size_spin.setValue(s.whisper_batch_size)
         self.whisper_lang_edit.setText(s.whisper_language)
 
         self._asr_cloud_data = [dict(c) for c in s.asr_cloud_configs]
@@ -932,6 +940,7 @@ class SettingsDialog(QDialog):
         # 语音识别
         s.asr_type = "local" if self.asr_type_combo.currentIndex() == 0 else "cloud"
         s.whisper_model = self.whisper_combo.currentText()
+        s.whisper_batch_size = self.batch_size_spin.value()
         s.asr_cloud_configs = [{k: v for k, v in d.items() if k != "_widgets"} for d in self._asr_cloud_data]
         if s.asr_cloud_configs:
             s.asr_cloud_active = s.asr_cloud_configs[0].get("name", "")

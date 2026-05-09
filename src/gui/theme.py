@@ -491,6 +491,18 @@ def build_stylesheet(theme_name: str) -> str:
         letter-spacing: 0.5px;
         border: none;
     }}
+    QLineEdit[class="chat-search"] {{
+        background: {c['input_bg']};
+        border: 1px solid {c['border']};
+        border-radius: 4px;
+        padding: 4px 8px;
+        margin: 4px 8px;
+        color: {c['text']};
+        font-size: 12px;
+    }}
+    QLineEdit[class="chat-search"]:focus {{
+        border: 1.5px solid {c['accent']};
+    }}
     QTreeWidget[class="session-tree"] {{
         background: {c['surface']};
         border: none;

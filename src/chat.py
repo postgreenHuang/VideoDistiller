@@ -343,5 +343,65 @@ def list_sessions() -> list[dict]:
             "created_at": data.get("created_at", ""),
             "slides_path": data.get("slides_path", ""),
             "notes_path": data.get("notes_path", ""),
+            "hidden": data.get("hidden", False),
+            "order": data.get("order", 0),
         })
+
+    # 按 order 排序，相同 order 按时间戳倒序
+    results.sort(key=lambda s: (s["folder_id"], s["order"], s["session_id"]), reverse=False)
+    # order 默认 0，时间戳已是倒序，所以需要按 folder_id 分组后反转
+    # 实际效果：有 order 的按 order 排，没有的按时间倒序
+    grouped = {}
+    for s in results:
+        grouped.setdefault(s["folder_id"], []).append(s)
+    ordered = []
+    for fid, items in grouped.items():
+        has_custom_order = any(s["order"] != 0 for s in items)
+        if has_custom_order:
+            items.sort(key=lambda s: s["order"])
+        else:
+            items.sort(key=lambda s: s["session_id"], reverse=True)
+        ordered.extend(items)
+    return ordered
     return results
+
+
+def toggle_session_hidden(session_ids: list[str]):
+    """批量切换 session 的隐藏状态"""
+    for sid in session_ids:
+        hfile = _SESSIONS_DIR / sid / "chat_history.json"
+        if not hfile.is_file():
+            continue
+        try:
+            data = json.loads(hfile.read_text(encoding="utf-8"))
+            data["hidden"] = not data.get("hidden", False)
+            hfile.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            continue
+
+
+def rename_session(session_id: str, new_name: str):
+    """重命名 session"""
+    hfile = _SESSIONS_DIR / session_id / "chat_history.json"
+    if not hfile.is_file():
+        return
+    try:
+        data = json.loads(hfile.read_text(encoding="utf-8"))
+        data["name"] = new_name
+        hfile.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def reorder_session(session_id: str, direction: int):
+    """调整 session 显示顺序。direction: -1=上移, 1=下移"""
+    hfile = _SESSIONS_DIR / session_id / "chat_history.json"
+    if not hfile.is_file():
+        return
+    try:
+        data = json.loads(hfile.read_text(encoding="utf-8"))
+        order = data.get("order", 0)
+        data["order"] = order + direction
+        hfile.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
