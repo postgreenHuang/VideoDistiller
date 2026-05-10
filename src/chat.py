@@ -142,7 +142,7 @@ class ChatSession:
         payload = {
             "model": self.model,
             "messages": messages,
-            "max_tokens": 2048,
+            "max_tokens": 8192,
         }
         resp = requests.post(url, json=payload, headers=headers, timeout=120)
         resp.raise_for_status()
