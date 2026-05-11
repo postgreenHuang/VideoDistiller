@@ -24,6 +24,12 @@
 **一句话：扔一个视频进来，拿走一份能读、能搜、能问的学习笔记。**
 
 ---
+<img width="1005" height="862" alt="图片" src="https://github.com/user-attachments/assets/91241e96-5158-490f-abfd-c5662a921dd3" />
+<img width="1251" height="863" alt="图片" src="https://github.com/user-attachments/assets/7b8527a0-d6b4-4d5c-88bc-e8526ac948d9" />
+<img width="587" height="604" alt="图片" src="https://github.com/user-attachments/assets/592606d9-e2cb-4fe8-9353-ca609b901120" />
+
+
+
 
 ## ✨ 功能亮点
 
