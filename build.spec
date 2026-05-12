@@ -2,11 +2,15 @@
 import os
 import sys
 
+# faster-whisper runtime files — 必须在 Analysis 之前收集
+from PyInstaller.utils.hooks import collect_all
+fw_datas, fw_binaries, fw_hiddenimports = collect_all('faster_whisper')
+
 a = Analysis(
     ['main.py'],
     pathex=[],
-    binaries=[],
-    datas=[('src', 'src'), ('icon.ico', '.')],
+    binaries=fw_binaries,
+    datas=[('src', 'src'), ('icon.ico', '.')] + fw_datas,
     hiddenimports=[
         'scipy.special._ufuncs',
         'scipy.special._specfun',
@@ -14,20 +18,13 @@ a = Analysis(
         'scipy.stats._distn_infrastructure',
         'skimage',
         'skimage.metrics',
-    ],
+    ] + fw_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
     excludes=['nltk', 'scipy.stats.distributions'],
     noarchive=False,
 )
-
-# faster-whisper runtime files
-from PyInstaller.utils.hooks import collect_all
-fw_datas, fw_binaries, fw_hiddenimports = collect_all('faster_whisper')
-a.datas += [(d[0], d[1], 'DATA') for d in fw_datas]
-a.binaries += [(b[0], b[1], 'BINARY') for b in fw_binaries]
-a.hiddenimports += fw_hiddenimports
 
 pyz = PYZ(a.pure)
 
