@@ -25,8 +25,8 @@ a = Analysis(
 # faster-whisper runtime files
 from PyInstaller.utils.hooks import collect_all
 fw_datas, fw_binaries, fw_hiddenimports = collect_all('faster_whisper')
-a.datas += fw_datas
-a.binaries += fw_binaries
+a.datas += [(d[0], d[1], 'DATA') for d in fw_datas]
+a.binaries += [(b[0], b[1], 'BINARY') for b in fw_binaries]
 a.hiddenimports += fw_hiddenimports
 
 pyz = PYZ(a.pure)
