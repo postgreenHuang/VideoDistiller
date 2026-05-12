@@ -6,7 +6,7 @@ a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[('src', 'src')],
+    datas=[('src', 'src'), ('icon.ico', '.')],
     hiddenimports=[
         'scipy.special._ufuncs',
         'scipy.special._specfun',
@@ -37,6 +37,7 @@ exe = EXE(
     [],
     exclude_binaries=True,
     name='Video-Distiller',
+    icon='icon.ico',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -63,7 +64,7 @@ if sys.platform == 'darwin':
     app = BUNDLE(
         coll,
         name='Video-Distiller.app',
-        icon=None,
+        icon='icon.ico',
         bundle_identifier='com.videodistiller.app',
         info_plist={
             'NSHighResolutionCapable': True,

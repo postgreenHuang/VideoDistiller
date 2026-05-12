@@ -4,6 +4,7 @@ PySide6, Apple 风格, Light/Dark 主题, Settings 集成
 """
 
 import os
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -15,7 +16,7 @@ from PySide6.QtWidgets import (
     QToolButton, QListView, QScrollArea,
 )
 from PySide6.QtCore import Qt, QThread, Signal, QTimer
-from PySide6.QtGui import QDragEnterEvent, QDropEvent
+from PySide6.QtGui import QDragEnterEvent, QDropEvent, QIcon
 from src.config import (
     load_settings, save_settings, Settings,
 )
@@ -78,6 +79,13 @@ class MainWindow(QMainWindow):
         self.settings: Settings = load_settings()
         self._theme = self.settings.theme
         self.setWindowTitle("Video-Distiller")
+        # 窗口图标：开发时从项目根目录找，打包后从 _MEIPASS 找
+        if getattr(sys, 'frozen', False):
+            icon_path = os.path.join(sys._MEIPASS, 'icon.ico')
+        else:
+            icon_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'icon.ico')
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
         self.setMinimumSize(820, 620)
         self.setStyleSheet(build_stylesheet(self._theme))
         self._build_ui()
@@ -1815,26 +1823,68 @@ class _BatchWorker(QThread):
                             self._failed_videos.append(self.videos[vi])
                             self.video_progress.emit(success + failed, total)
 
-        # ─── 阶段二：Step 2-5 逐视频串行处理 ───
-        if tasks:
-            self.log.emit(f"\n阶段二：逐视频处理 Step 2-5")
+        # ─── 构建活跃列表：Step 1 通过的视频 ───
+        active = []
         for vi, name, vpath, pdir, skip in tasks:
+            if "1" in skip or vi in step1_ok:
+                active.append((vi, name, vpath, pdir, skip))
+
+        failed_set = set()          # vi of videos that failed at steps 2-5
+        completed_results = {}      # 用于步骤间传递结果 (e.g. Step3→Step4)
+
+        step_fns = {
+            "2": self._do_step_2,
+            "3": self._do_step_3,
+            "4": self._do_step_4,
+            "5": self._do_step_5,
+        }
+        step_labels = {"2": "语音转录", "3": "智能选帧", "4": "图片理解", "5": "AI 聚合"}
+
+        for step_num in ("2", "3", "4", "5"):
             if self._cancel:
                 break
-            # Step 1 需要但没成功的，跳过
-            if "1" not in skip and vi not in step1_ok:
+            need = [t for t in active
+                    if step_num not in t[4] and t[0] not in failed_set]
+            if not need:
                 continue
 
-            try:
-                self._run_video_dag(vpath, pdir, name, vi, total, skip)
-                if not self._cancel:
-                    success += 1
-            except Exception as e:
-                self.log.emit(f"[{name}] ✗ 失败: {e}\n")
-                failed += 1
-                self._failed_videos.append(vpath)
+            self.log.emit(
+                f"\n══ Step {step_num} {step_labels[step_num]} "
+                f"({len(need)} 个视频) ══")
+
+            for vi, name, vpath, pdir, skip in need:
+                if self._cancel:
+                    break
+                try:
+                    result = step_fns[step_num](
+                        vpath, pdir, name, vi, total, completed_results, name)
+                    if isinstance(result, dict):
+                        completed_results[f"{vi}:{step_num}"] = result
+                except Exception as e:
+                    self.log.emit(f"[{name}] ✗ Step {step_num} 失败: {e}")
+                    failed += 1
+                    failed_set.add(vi)
+                    self._failed_videos.append(vpath)
 
             self.video_progress.emit(success + failed, total)
+
+            # Step 2 全部完成后释放 GPU 显存（避免反复加载卸载 Whisper）
+            if step_num == "2":
+                asr_uses_local = not (
+                    self.asr_data and self.asr_data.get("type") != "local")
+                if asr_uses_local:
+                    import gc
+                    gc.collect()
+                    try:
+                        import torch
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                            self.log.emit("GPU 显存已释放 (Whisper)")
+                    except ImportError:
+                        pass
+
+        success += len(active) - len(failed_set)
+        self.video_progress.emit(success + failed, total)
 
         msg = f"完成 {success}/{total}"
         if failed:
@@ -1848,84 +1898,7 @@ class _BatchWorker(QThread):
         self._do_step_1a(video_path, project_dir, name, vi, total, {}, name)
         self._do_step_1b(video_path, project_dir, name, vi, total, {}, name)
 
-    def _run_video_dag(self, video_path, project_dir, name, vi, total, skip):
-        """单个视频的 Step 2-5 DAG 调度（步骤内并发）"""
-        from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
-
-        completed = {}
-        running = {}
-        errors = {}
-
-        # GPU 互斥检测
-        asr_uses_gpu = not (self.asr_data and self.asr_data.get("type") != "local")
-        vision_uses_gpu = (self.vision_config or {}).get("type", "ollama") == "ollama"
-        gpu_steps = set()
-        if asr_uses_gpu:
-            gpu_steps.add("2")
-        if vision_uses_gpu:
-            gpu_steps.add("4")
-
-        def deps_met(step):
-            deps = self._STEP_DAG[step][0]
-            return all(d in completed for d in deps) and not any(d in errors for d in deps)
-
-        def submit_ready(pool):
-            current_gpu = any(running.get(f) in gpu_steps for f in running)
-            for step in self._STEP_DAG:
-                if step in completed or step in errors:
-                    continue
-                if step in [running[f] for f in running]:
-                    continue
-                step_num = step.rstrip("ab")
-                if step_num in skip:
-                    completed[step] = True
-                    continue
-                # Step 1 已在阶段一完成，直接标记
-                if step in ("1a", "1b"):
-                    completed[step] = True
-                    continue
-                if not deps_met(step):
-                    continue
-                if step in gpu_steps and current_gpu:
-                    continue
-                fn_map = {
-                    "2":  self._do_step_2,
-                    "3":  self._do_step_3,
-                    "4":  self._do_step_4,
-                    "5":  self._do_step_5,
-                }
-                if step not in fn_map:
-                    continue
-                future = pool.submit(
-                    fn_map[step], video_path, project_dir, name,
-                    vi, total, completed, name,
-                )
-                running[future] = step
-                if step in gpu_steps:
-                    current_gpu = True
-
-        with ThreadPoolExecutor(max_workers=3) as pool:
-            submit_ready(pool)
-            while running:
-                if self._cancel:
-                    break
-                done, _ = wait(running.keys(), return_when=FIRST_COMPLETED)
-                for f in done:
-                    step = running.pop(f)
-                    label = self._STEP_DAG[step][1]
-                    try:
-                        result = f.result()
-                        completed[step] = result
-                    except Exception as e:
-                        errors[step] = str(e)
-                        self.log.emit(f"[{name}] ✗ {label} 失败: {e}")
-                submit_ready(pool)
-
-        if errors:
-            failed_steps = ", ".join(self._STEP_DAG[s][1] for s in errors)
-            raise RuntimeError(f"步骤失败: {failed_steps}")
-
-    # ─── DAG 各步骤实现 ───
+    # ─── 各步骤实现 ───
 
     def _do_step_1a(self, video_path, project_dir, name, vi, total, completed, vname):
         if self._cancel:
@@ -2022,18 +1995,6 @@ class _BatchWorker(QThread):
         _dt = self._fmt_elapsed(__import__("time").time() - _t0)
         self.step_time.emit(f"[{vname}] Step 2: {_dt}")
         self.log.emit(f"[{vname}] Step 2 完成 ({_dt})")
-
-        # 本地 Whisper 用完立即释放 GPU 显存，确保 Step 4 本地 Ollama 有空间加载
-        if asr_type == "local":
-            import gc
-            gc.collect()
-            try:
-                import torch
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    self.log.emit(f"[{vname}] GPU 显存已释放 (Whisper)")
-            except ImportError:
-                pass
 
         return True
 

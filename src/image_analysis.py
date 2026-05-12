@@ -336,17 +336,8 @@ def analyze_images(
 
     out_path = unified_json_path or os.path.join(output_dir, "slides.json")
 
-    # Ollama 本地模型用完后立即卸载，释放显存
-    if vtype == "ollama":
-        try:
-            import requests as _req
-            _req.post(
-                base_url.rstrip("/") + "/api/generate",
-                json={"model": model, "keep_alive": 0},
-                timeout=10,
-            )
-        except Exception:
-            pass
+    # Ollama 模型由 keep_alive 配置管理，不再强制卸载
+    # keep_alive=0 瞬间释放大量 VRAM 会导致显示驱动崩溃黑屏
 
     return {
         "slides": slides,

@@ -637,31 +637,17 @@ class _QuickQuestionsDialog(QDialog):
         self.setMinimumHeight(200)
         layout = QVBoxLayout(self)
 
+        self._rows_layout = QVBoxLayout()
+        self._rows_layout.setSpacing(6)
         self._rows = []
-        grid = QGridLayout()
-        grid.setSpacing(6)
-        for i, q in enumerate(questions):
-            name_edit = QLineEdit(q.get("name", ""))
-            name_edit.setPlaceholderText("名称")
-            name_edit.setFixedWidth(200)
-            text_edit = QLineEdit(q.get("text", ""))
-            text_edit.setPlaceholderText("提问内容")
-            del_btn = QPushButton("✕")
-            del_btn.setFixedSize(24, 24)
-            del_btn.setProperty("class", "secondary")
-            grid.addWidget(name_edit, i, 0)
-            grid.addWidget(text_edit, i, 1)
-            grid.addWidget(del_btn, i, 2)
-            row = (name_edit, text_edit)
-            self._rows.append(row)
-            del_btn.clicked.connect(lambda checked=False, r=row: self._remove_row(r, grid))
+        for q in questions:
+            self._create_row(q.get("name", ""), q.get("text", ""))
 
-        layout.addLayout(grid)
-        self._grid = grid
+        layout.addLayout(self._rows_layout)
 
         add_btn = QPushButton("+ 添加快捷提问")
         add_btn.setProperty("class", "secondary")
-        add_btn.clicked.connect(lambda: self._add_row(grid))
+        add_btn.clicked.connect(self._add_row)
         layout.addWidget(add_btn)
 
         bbox = QDialogButtonBox(
@@ -671,45 +657,46 @@ class _QuickQuestionsDialog(QDialog):
         bbox.rejected.connect(self.reject)
         layout.addWidget(bbox)
 
-    def _add_row(self, grid: QGridLayout):
-        i = len(self._rows)
-        name_edit = QLineEdit()
+    def _create_row(self, name: str, text: str):
+        row_layout = QHBoxLayout()
+        row_layout.setSpacing(6)
+        name_edit = QLineEdit(name)
         name_edit.setPlaceholderText("名称")
         name_edit.setFixedWidth(200)
-        text_edit = QLineEdit()
+        text_edit = QLineEdit(text)
         text_edit.setPlaceholderText("提问内容")
         del_btn = QPushButton("✕")
         del_btn.setFixedSize(24, 24)
         del_btn.setProperty("class", "secondary")
-        grid.addWidget(name_edit, i, 0)
-        grid.addWidget(text_edit, i, 1)
-        grid.addWidget(del_btn, i, 2)
-        row = (name_edit, text_edit)
+        row_layout.addWidget(name_edit)
+        row_layout.addWidget(text_edit)
+        row_layout.addWidget(del_btn)
+        self._rows_layout.addLayout(row_layout)
+        row = (name_edit, text_edit, row_layout)
         self._rows.append(row)
-        del_btn.clicked.connect(lambda checked=False, r=row: self._remove_row(r, grid))
+        del_btn.clicked.connect(lambda checked=False, r=row: self._remove_row(r))
 
-    def _remove_row(self, row, grid: QGridLayout):
-        name_edit, text_edit = row
-        # 隐藏而不是删除（避免 grid 重新排列问题）
-        name_edit.setVisible(False)
-        text_edit.setVisible(False)
-        # 找到并隐藏对应的删除按钮
-        for i in range(grid.count()):
-            item = grid.itemAt(i)
-            if item and item.widget() == name_edit:
-                # 同行的删除按钮在 column 2
-                del_item = grid.itemAt(i + 2) if (i + 2) < grid.count() else None
-                if del_item and del_item.widget():
-                    del_item.widget().setVisible(False)
-                break
+    def _add_row(self):
+        self._create_row("", "")
+        self.adjustSize()
+
+    def _remove_row(self, row):
+        name_edit, text_edit, row_layout = row
+        # 清除该行的所有 widget
+        while row_layout.count():
+            item = row_layout.takeAt(0)
+            w = item.widget()
+            if w:
+                w.setParent(None)
+                w.deleteLater()
+        self._rows_layout.removeItem(row_layout)
         if row in self._rows:
             self._rows.remove(row)
+        self.adjustSize()
 
     def get_questions(self) -> list[dict]:
         result = []
-        for name_edit, text_edit in self._rows:
-            if not name_edit.isVisible():
-                continue
+        for name_edit, text_edit, _ in self._rows:
             name = name_edit.text().strip()
             text = text_edit.text().strip()
             if name and text:
